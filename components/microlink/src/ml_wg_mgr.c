@@ -16,6 +16,7 @@
 #include "ml_lwip_lock.h"
 #include "ml_config_httpd.h"
 #include "esp_log.h"
+#include "esp_attr.h"
 #include "esp_random.h"
 #include "esp_netif.h"
 #include "lwip/sockets.h"
@@ -70,8 +71,16 @@ typedef struct {
     bool active;
 } disco_probe_t;
 
-#define MAX_PENDING_PROBES 32
-static disco_probe_t pending_probes[MAX_PENDING_PROBES];
+#define MAX_PENDING_PROBES ML_MAX_PEERS
+/* DISCO handling runs in tasks, never in a cache-disabled ISR. */
+static EXT_RAM_BSS_ATTR disco_probe_t pending_probes[MAX_PENDING_PROBES];
+
+static void discard_peer_probes(int peer_idx) {
+    for (int i = 0; i < MAX_PENDING_PROBES; ++i) {
+        if (pending_probes[i].peer_index == peer_idx)
+            pending_probes[i].active = false;
+    }
+}
 
 /* ============================================================================
  * Base64 Key Encoding (wireguard-lwip API requires base64 keys)
@@ -209,7 +218,7 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
 
     /* Keepalives, handshake retries and rekeys come here from wireguardif_periodic()
      * on the WG manager task, while the tcpip thread may be sending at the
-     * same moment: hold the core lock (a no-op when the caller already has it). */
+     * same moment: take lwIP's state (nothing when the caller already has it). */
     bool _l = ml_lwip_lock();
     err_t err = udp_sendto(s_wg_output_pcb, p, &dst, dest_port);
     ml_lwip_unlock(_l);
@@ -220,6 +229,66 @@ static err_t wg_udp_output_cb(uint32_t dest_ip, uint16_t dest_port,
 /* ============================================================================
  * WireGuard Interface Initialization
  * ========================================================================== */
+
+/* One IPv4 tunnel: apply the control server's grants to decrypted traffic
+ * before the packet can reach any application socket. */
+static microlink_t *s_filter_owner;
+static netif_output_fn s_filter_output;
+
+typedef struct {
+    struct netif *netif;
+    SemaphoreHandle_t done;
+} wg_shutdown_t;
+
+static void wg_shutdown_on_tcpip(void *arg)
+{
+    wg_shutdown_t *shutdown = arg;
+    wireguardif_shutdown(shutdown->netif);
+    netif_set_link_down(shutdown->netif);
+    netif_set_down(shutdown->netif);
+    netif_remove(shutdown->netif);
+    if (s_wg_output_pcb) {
+        udp_remove(s_wg_output_pcb);
+        s_wg_output_pcb = NULL;
+    }
+    s_filter_owner = NULL;
+    s_filter_output = NULL;
+    xSemaphoreGive(shutdown->done);
+}
+
+static err_t wg_filtered_output(struct netif *netif, struct pbuf *packet, const ip4_addr_t *destination)
+{
+    uint8_t header[80];
+    size_t copied = packet->tot_len < sizeof(header) ? packet->tot_len : sizeof(header);
+    pbuf_copy_partial(packet, header, copied, 0);
+    microlink_t *ml = s_filter_owner;
+    if (!ml || !ml->peer_map_valid || microlink_key_expired(ml)) return ERR_CONN;
+    if (xSemaphoreTake(ml->filter_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        ml_packet_filter_udp_reply(&ml->udp_flows, header, packet->tot_len, ml->vpn_ip,
+                                  ml_get_time_ms(), true);
+        xSemaphoreGive(ml->filter_mutex);
+    }
+    return s_filter_output ? s_filter_output(netif, packet, destination) : ERR_CONN;
+}
+
+static err_t wg_filtered_input(struct pbuf *packet, struct netif *netif)
+{
+    uint8_t header[80];
+    size_t copied = packet->tot_len < sizeof(header) ? packet->tot_len : sizeof(header);
+    pbuf_copy_partial(packet, header, copied, 0);
+    microlink_t *ml = s_filter_owner;
+    bool accepted = false;
+    if (ml && ml->peer_map_valid && !microlink_key_expired(ml) &&
+        xSemaphoreTake(ml->filter_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        accepted = ml_packet_filter_accept(ml->packet_filters, header, packet->tot_len, ml->vpn_ip) ||
+            (ml->packet_filters && ml_packet_filter_udp_reply(&ml->udp_flows, header,
+                packet->tot_len, ml->vpn_ip, ml_get_time_ms(), false));
+        xSemaphoreGive(ml->filter_mutex);
+    }
+    if (accepted) return tcpip_input(packet, netif);
+    pbuf_free(packet);
+    return ERR_OK;
+}
 
 static esp_err_t wg_init_interface(microlink_t *ml) {
     /* Convert our WG private key to base64 */
@@ -242,41 +311,38 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
     /* Disable internal socket binding (we use magicsock mode) */
     wireguardif_disable_socket_bind();
 
-    /* Initialize WireGuard netif. The whole raw-lwIP bring-up below (pcb setup,
-     * splicing into netif_list, bringing the netif up, the output pcb) runs
-     * under the core lock so it cannot race the TCP/IP thread. */
-    netif->state = &wg_init;
-    bool _l = ml_lwip_lock();
-    err_t err = wireguardif_init(netif);
-    if (err != ERR_OK) {
-        ml_lwip_unlock(_l);
-        ESP_LOGE(TAG, "wireguardif_init failed: %d", err);
-        free(netif);
-        return ESP_FAIL;
-    }
-
     /* Set IP addresses: our VPN IP (or temporary until we get one) */
+    ip4_addr_t address, mask, gateway;
     if (ml->vpn_ip != 0) {
         uint8_t a = (ml->vpn_ip >> 24) & 0xFF;
         uint8_t b = (ml->vpn_ip >> 16) & 0xFF;
         uint8_t c = (ml->vpn_ip >> 8) & 0xFF;
         uint8_t d = ml->vpn_ip & 0xFF;
-        IP4_ADDR(&netif->ip_addr.u_addr.ip4, a, b, c, d);
+        IP4_ADDR(&address, a, b, c, d);
     } else {
-        IP4_ADDR(&netif->ip_addr.u_addr.ip4, 100, 64, 0, 1);  /* temp */
+        IP4_ADDR(&address, 100, 64, 0, 1);  /* temp */
     }
-    IP4_ADDR(&netif->netmask.u_addr.ip4, 255, 192, 0, 0);     /* /10 */
-    IP4_ADDR(&netif->gw.u_addr.ip4, 0, 0, 0, 0);
+    IP4_ADDR(&mask, 255, 192, 0, 0);     /* /10 */
+    IP4_ADDR(&gateway, 0, 0, 0, 0);
+
+    /* netif_add assigns a unique interface index and initializes routing
+     * state. Directly splicing netif_list reused the LAN interface's index. */
+    bool _l = ml_lwip_lock();
+    if (!netif_add(netif, &address, &mask, &gateway, &wg_init,
+                   wireguardif_init, wg_filtered_input)) {
+        ml_lwip_unlock(_l);
+        ESP_LOGE(TAG, "Could not add WireGuard interface");
+        free(netif);
+        return ESP_FAIL;
+    }
 
     /* Use tcpip_input so decrypted packets are posted to the TCPIP thread.
      * Required for TCP (esp_http_server sockets) — ip_input from the wg_mgr
      * thread accesses TCP PCB state without synchronization.  The WG output
      * callback uses raw udp_sendto (not BSD sendto) to avoid deadlock. */
-    netif->input = tcpip_input;
-
-    /* Add to lwIP netif list (bypass netif_add which wants init callback) */
-    netif->next = netif_list;
-    netif_list = netif;
+    s_filter_owner = ml;
+    s_filter_output = netif->output;
+    netif->output = wg_filtered_output;
 
     /* Bring interface up */
     netif_set_up(netif);
@@ -349,7 +415,11 @@ static void wg_update_vpn_ip(microlink_t *ml) {
         uint8_t b = (ml->vpn_ip >> 16) & 0xFF;
         uint8_t c = (ml->vpn_ip >> 8) & 0xFF;
         uint8_t d = ml->vpn_ip & 0xFF;
-        IP4_ADDR(&netif->ip_addr.u_addr.ip4, a, b, c, d);
+        ip4_addr_t address;
+        IP4_ADDR(&address, a, b, c, d);
+        bool acquired = ml_lwip_lock();
+        netif_set_ipaddr(netif, &address);
+        ml_lwip_unlock(acquired);
     }
 }
 
@@ -384,6 +454,22 @@ static int find_peer_by_disco_key(microlink_t *ml, const uint8_t *disco_key) {
     return -1;
 }
 
+static int find_peer_by_id(microlink_t *ml, uint64_t id)
+{
+    if (!id) return -1;
+    for (int i = 0; i < ml->peer_count; ++i)
+        if (ml->peers[i].active && ml->peers[i].node_id == id) return i;
+    return -1;
+}
+
+static int find_updated_peer(microlink_t *ml, const ml_peer_update_t *update)
+{
+    int idx = find_peer_by_id(ml, update->node_id);
+    return idx >= 0 ? idx : find_peer_by_key(ml, update->public_key);
+}
+
+static void remove_peer(microlink_t *ml, const ml_peer_update_t *update);
+
 static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     /* Peer allowlist filter: don't waste WG slots on non-allowed peers.
      * Still process updates for existing peers (they may become allowed later). */
@@ -391,8 +477,11 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
         return -1;  /* Silently skip — peer not in allowlist */
     }
 
-    /* Check if peer already exists */
-    int idx = find_peer_by_key(ml, update->public_key);
+    /* A rotated key must retire the old WireGuard session for this node ID. */
+    int idx = find_peer_by_id(ml, update->node_id);
+    if (idx >= 0 && memcmp(ml->peers[idx].public_key, update->public_key, 32))
+        remove_peer(ml, update);
+    idx = find_peer_by_key(ml, update->public_key);
     if (idx >= 0) {
         ESP_LOGI(TAG, "Updating existing peer %s (idx=%d)", update->hostname, idx);
     } else {
@@ -433,6 +522,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
                       ml_lwip_unlock(_wl); }
                 }
                 ml->peers[evict_idx].active = false;
+                discard_peer_probes(evict_idx);
                 idx = evict_idx;
             }
         }
@@ -448,6 +538,9 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     }
 
     ml_peer_t *p = &ml->peers[idx];
+    /* A late pong from the previous map must not restore its retired path. */
+    discard_peer_probes(idx);
+    p->node_id = update->node_id;
     p->vpn_ip = update->vpn_ip;
     memcpy(p->public_key, update->public_key, 32);
     memcpy(p->disco_key, update->disco_key, 32);
@@ -534,6 +627,11 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
 
         if (wg_err == ERR_OK && wg_peer_idx != WIREGUARDIF_INVALID_INDEX) {
             p->wg_peer_index = wg_peer_idx;
+            /* add_peer reuses an existing WG session, including its endpoint.
+             * Keep that session, but retire the endpoint with the DISCO trust
+             * above. Otherwise a roaming peer's replies use its old address
+             * indefinitely while has_direct_path is already false. */
+            wireguardif_reset_endpoint(netif, wg_peer_idx);
 
             /* Verify the WG internal peer key matches what we passed */
             struct wireguard_device *dev = (struct wireguard_device *)netif->state;
@@ -561,7 +659,7 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
     }
 
     /* Persist to NVS for fast boot next time */
-    ml_peer_nvs_save(p);
+    /* Peer maps are refreshed by the server; do not write them to flash. */
 
     /* Send CallMeMaybe to trigger peer-initiated handshake (NAT traversal).
      * Skip on cellular: our endpoints are behind carrier-grade NAT and
@@ -605,8 +703,10 @@ static int add_peer(microlink_t *ml, const ml_peer_update_t *update) {
 }
 
 static void remove_peer(microlink_t *ml, const ml_peer_update_t *update) {
-    int idx = find_peer_by_key(ml, update->public_key);
+    int idx = find_updated_peer(ml, update);
     if (idx < 0) return;
+
+    discard_peer_probes(idx);
 
     /* Remove from wireguard-lwip */
     if (ml->wg_netif && ml->peers[idx].wg_peer_index >= 0) {
@@ -628,42 +728,143 @@ static void remove_peer(microlink_t *ml, const ml_peer_update_t *update) {
     }
 }
 
-static void process_peer_updates(microlink_t *ml) {
-    ml_peer_update_t *update;
-    while (xQueueReceive(ml->peer_update_queue, &update, 0) == pdTRUE) {
-        if (!update) continue;
-        switch (update->action) {
-        case ML_PEER_ADD:
-            add_peer(ml, update);
-            break;
-        case ML_PEER_REMOVE:
-            remove_peer(ml, update);
-            break;
-        case ML_PEER_UPDATE_ENDPOINT:
-            /* Update endpoint/DERP for existing peer (delta patch) */
-            {
-                int idx = find_peer_by_key(ml, update->public_key);
-                if (idx >= 0) {
-                    ml_peer_t *p = &ml->peers[idx];
-                    if (update->endpoint_count > 0) {
-                        p->endpoint_count = update->endpoint_count;
-                        for (int i = 0; i < update->endpoint_count && i < ML_MAX_ENDPOINTS; i++) {
-                            p->endpoints[i].ip = update->endpoints[i].ip;
-                            p->endpoints[i].port = update->endpoints[i].port;
-                            p->endpoints[i].is_ipv6 = update->endpoints[i].is_ipv6;
-                        }
-                    }
-                    if (update->derp_region > 0) {
-                        p->derp_region = update->derp_region;
-                    }
-                    ESP_LOGI(TAG, "Peer patched: %s (eps=%d derp=%d)",
-                             p->hostname, p->endpoint_count, p->derp_region);
-                }
-            }
+/* A peer with a WireGuard session that it may be using right now. */
+static bool peer_session_up(microlink_t *ml, int idx)
+{
+    if (!ml->wg_netif || ml->peers[idx].wg_peer_index < 0) return false;
+    bool acquired = ml_lwip_lock();
+    bool up = wireguardif_peer_has_session((struct netif *)ml->wg_netif,
+                                           (u8_t)ml->peers[idx].wg_peer_index);
+    ml_lwip_unlock(acquired);
+    return up;
+}
+
+static void invalidate_peer_map(microlink_t *ml, unsigned generation)
+{
+    ml->peer_map_failed_generation = generation;
+    ml->peer_map_valid = false;
+}
+
+/* Gives the slots to the peers that ml_peer_select ranks first, and takes
+ * them from the peers that it no longer does before it fills them. */
+static void select_peers(microlink_t *ml, unsigned generation)
+{
+    ml_peer_dir_t *dir = &ml->peer_dir;
+    for (unsigned i = 0; i < dir->count; ++i) {
+        ml_peer_entry_t *entry = &dir->entries[i];
+        int idx = entry->installed ? find_updated_peer(ml, &entry->peer) : -1;
+        entry->installed = idx >= 0;
+        entry->allowed = ml_config_peer_is_allowed(ml->config_httpd, entry->peer.vpn_ip);
+        entry->priority = ml->config.priority_peer_ip &&
+            entry->peer.vpn_ip == ml->config.priority_peer_ip;
+        entry->session = entry->installed && peer_session_up(ml, idx);
+    }
+    unsigned left_out = ml_peer_select(dir, ML_MAX_PEERS);
+    if (left_out != ml->peers_left_out)
+        ESP_LOGW(TAG, "%u live peers, %u of them without a WireGuard slot",
+                 dir->count + dir->overflow_count + dir->untracked, left_out);
+    ml->peers_left_out = left_out;
+    for (unsigned i = 0; i < dir->count; ++i) {
+        ml_peer_entry_t *entry = &dir->entries[i];
+        if (entry->installed && !entry->selected) {
+            remove_peer(ml, &entry->peer);
+            entry->installed = false;
+        }
+    }
+    for (unsigned i = 0; i < dir->count; ++i) {
+        ml_peer_entry_t *entry = &dir->entries[i];
+        if (!entry->selected || entry->installed) continue;
+        if (add_peer(ml, &entry->peer) >= 0) entry->installed = true;
+        else invalidate_peer_map(ml, generation);
+    }
+    dir->changed = false;
+}
+
+/* Every live peer goes into the directory; an installed peer also gets
+ * the change in its slot at once. A new peer, a removed one and a change
+ * of presence change which peers hold the slots: a complete map selects
+ * them when it ends, and a change after it when the queue is drained. */
+static void apply_peer_update(microlink_t *ml, const ml_peer_update_t *update)
+{
+    ml_peer_dir_t *dir = &ml->peer_dir;
+    ml_peer_entry_t *entry;
+    switch (update->action) {
+    case ML_PEER_SYNC:
+        ml_peer_dir_start_snapshot(dir);
+        break;
+    case ML_PEER_ADD:
+        entry = ml_peer_dir_put(dir, update);
+        dir->changed = true;
+        if (!entry)
+            ESP_LOGW(TAG, "Peer directory full (%u), %s left out", dir->count, update->hostname);
+        else if (entry->installed && add_peer(ml, &entry->peer) < 0)
+            invalidate_peer_map(ml, update->generation);
+        break;
+    case ML_PEER_REMOVE:
+        entry = ml_peer_dir_find(dir, update->node_id, update->has_key ? update->public_key : NULL);
+        if (!entry) {
+            if (ml_peer_dir_forget(dir, update->node_id)) dir->changed = true;
             break;
         }
-        free(update);
+        if (entry->installed) remove_peer(ml, &entry->peer);
+        ml_peer_dir_delete(dir, entry);
+        dir->changed = true;
+        break;
+    case ML_PEER_UPDATE_ENDPOINT:
+        entry = ml_peer_dir_find(dir, update->node_id, update->has_key ? update->public_key : NULL);
+        if (!entry) break;
+        if (ml_peer_dir_patch(entry, update) && entry->installed) add_peer(ml, &entry->peer);
+        if (update->has_online || update->has_last_seen) dir->changed = true;
+        break;
+    case ML_PEER_MAP_COMPLETE:
+        for (unsigned i = dir->count; i-- > 0;) {
+            entry = &dir->entries[i];
+            if (entry->seen) continue;
+            if (entry->installed) remove_peer(ml, &entry->peer);
+            ml_peer_dir_delete(dir, entry);
+        }
+        dir->snapshot = false;
+        select_peers(ml, update->generation);
+        if (update->generation == ml->peer_map_generation &&
+            update->generation != ml->peer_map_failed_generation)
+            ml->peer_map_valid = true;
+        break;
     }
+}
+
+/* Drops the peers that the complete map from index first of the batch does
+ * not name before the map stores its own, so that a full directory has room
+ * for the peers that are new in the map. */
+static void reclaim_unlisted(microlink_t *ml, const ml_peer_batch_t *batch, unsigned first)
+{
+    ml_peer_dir_t *dir = &ml->peer_dir;
+    unsigned end = first;
+    while (end < batch->count && batch->updates[end].action != ML_PEER_MAP_COMPLETE) ++end;
+    /* A map that did not parse to its end names only some of its peers. */
+    if (end == batch->count) return;
+    for (unsigned i = dir->count; i-- > 0;) {
+        ml_peer_entry_t *entry = &dir->entries[i];
+        if (ml_peer_batch_lists(batch, first, &entry->peer)) continue;
+        if (entry->installed) remove_peer(ml, &entry->peer);
+        ml_peer_dir_delete(dir, entry);
+        dir->changed = true;
+    }
+}
+
+static void process_peer_updates(microlink_t *ml) {
+    ml_peer_batch_t *batch;
+    while (xQueueReceive(ml->peer_update_queue, &batch, 0) == pdTRUE) {
+        if (!batch) continue;
+        for (unsigned i = 0; i < batch->count; ++i) {
+            const ml_peer_update_t *update = &batch->updates[i];
+            if (update->generation != ml->peer_map_generation) continue;
+            if (update->action == ML_PEER_SYNC) reclaim_unlisted(ml, batch, i + 1);
+            apply_peer_update(ml, update);
+        }
+        free(batch);
+    }
+    if (ml->peer_dir.changed && !ml->peer_dir.snapshot)
+        select_peers(ml, ml->peer_map_generation);
 }
 
 /* ============================================================================
@@ -931,6 +1132,10 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
         }
 
         ml_peer_t *p = &ml->peers[peer_idx];
+        if (!p->active || memcmp(p->disco_key, sender_disco_key, 32)) {
+            pending_probes[i].active = false;
+            continue;
+        }
         uint64_t rtt_ms = now - pending_probes[i].sent_ms;
 
         ESP_LOGD(TAG, "DISCO PONG from %s: RTT=%llu ms (via %s)",
@@ -946,73 +1151,24 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
             p->has_direct_path = true;
             p->trust_until_ms = now + ML_DISCO_TRUST_DURATION_MS;
 
-            /* Update WireGuard endpoint to direct path.
-             * Always update the stored endpoint. Only force a handshake if we
-             * already have an active WG session (peer has us in their config).
-             * For idle peers, the next incoming initiation will use this endpoint. */
+            /* A validated path changes routing, not crypto state. Idle peers
+             * remain passive; an active session uses the new endpoint without
+             * X25519/rekey work on every trust expiry or path switch. */
             if (ml->wg_netif && p->wg_peer_index >= 0) {
                 struct netif *netif = (struct netif *)ml->wg_netif;
                 ip_addr_t ep_ip;
                 IP_SET_TYPE_VAL(ep_ip, IPADDR_TYPE_V4);
                 ip4_addr_set_u32(ip_2_ip4(&ep_ip), htonl(pkt->src_ip));
-                wireguardif_update_endpoint(netif, (u8_t)p->wg_peer_index,
-                                             &ep_ip, pkt->src_port);
-
-                /* Only call connect (forces handshake) if:
-                 * 1. Peer has an active WG session, AND
-                 * 2. The endpoint actually changed (avoid re-handshake on every heartbeat PONG) */
-                ip_addr_t cur_ip;
-                u16_t cur_port;
-                err_t is_up = wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index,
-                                                       &cur_ip, &cur_port);
-                if (is_up == ERR_OK) {
-                    /* Check if endpoint actually changed */
-                    uint32_t cur_ip_u32 = ip4_addr_get_u32(ip_2_ip4(&cur_ip));
-                    uint32_t new_ip_u32 = htonl(pkt->src_ip);
-                    if (cur_ip_u32 != new_ip_u32 || cur_port != pkt->src_port) {
-                        { bool _wl = ml_lwip_lock(); wireguardif_connect(netif, (u8_t)p->wg_peer_index); ml_lwip_unlock(_wl); }
-                        ESP_LOGI(TAG, "WG endpoint SWITCHED to direct: %d.%d.%d.%d:%d for %s",
-                                 (int)((pkt->src_ip >> 24) & 0xFF), (int)((pkt->src_ip >> 16) & 0xFF),
-                                 (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF),
-                                 (int)pkt->src_port, p->hostname);
-                    }
-                } else {
-                    ESP_LOGI(TAG, "WG endpoint stored (no session): %d.%d.%d.%d:%d for %s",
-                             (int)((pkt->src_ip >> 24) & 0xFF), (int)((pkt->src_ip >> 16) & 0xFF),
-                             (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF),
-                             (int)pkt->src_port, p->hostname);
-                    /* First direct path discovery — send a one-shot handshake
-                     * via direct UDP. Do NOT use wireguardif_connect() which
-                     * sets peer->active=true and causes infinite handshake
-                     * retries (every 5s) when the peer has us trimmed.
-                     * Instead, just fire a single handshake init. If the peer
-                     * has us configured, it will respond and establish session.
-                     * If not, we stop and wait for them to initiate. */
-                    if (!p->tried_initial_handshake) {
-                        p->tried_initial_handshake = true;
-                        /* Store endpoint so wireguardif_connect sends to it */
-                        wireguardif_update_endpoint(netif, (u8_t)p->wg_peer_index,
-                                                     &ep_ip, pkt->src_port);
-                        /* Fire one handshake init but don't leave peer active.
-                         * wireguardif_connect sets active=true internally, so
-                         * we immediately clear it after to prevent retries. */
-                        { bool _wl = ml_lwip_lock(); wireguardif_connect(netif, (u8_t)p->wg_peer_index); ml_lwip_unlock(_wl); }
-                        /* Clear active to prevent infinite retry loop.
-                         * If handshake succeeds, the response handler will
-                         * establish the session regardless of active flag. */
-                        {
-                            struct wireguard_device *dev = (struct wireguard_device *)netif->state;
-                            if (dev && p->wg_peer_index < WIREGUARD_MAX_PEERS) {
-                                dev->peers[p->wg_peer_index].active = false;
-                            }
-                        }
-                        ESP_LOGI(TAG, "WG one-shot handshake to %s (first direct path)", p->hostname);
-                    }
-                }
+                wireguardif_roam_endpoint(netif, (u8_t)p->wg_peer_index,
+                                           &ep_ip, pkt->src_port);
             }
+
         }
 
-        pending_probes[i].active = false;
+        /* A probe goes out over UDP and DERP with one transaction, and each
+         * path answers. A relay pong does not prove a direct path, so the
+         * probe stays open for the direct pong until it times out. */
+        if (!pkt->via_derp) pending_probes[i].active = false;
         matched = true;
         break;
     }
@@ -1029,6 +1185,79 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                  name, pkt->via_derp ? "DERP" : "direct",
                  txid[0], txid[1], txid[2], txid[3], active_count);
     }
+}
+
+static void process_disco_call_me_maybe(microlink_t *ml, const ml_rx_packet_t *pkt,
+                                        const uint8_t *sender_disco_key,
+                                        const uint8_t *plaintext, size_t plaintext_len) {
+    /* Endpoint invitations arrive over DERP, with whole 18-byte entries. */
+    if (!pkt->via_derp || plaintext_len < 2 || (plaintext_len - 2) % 18) return;
+    /* CallMeMaybe: after type(1)+version(1), payload is N x 18-byte entries
+     * Each entry: 16-byte IP (IPv6 or IPv4-mapped) + 2-byte port (big-endian) */
+    int peer_idx = find_peer_by_disco_key(ml, sender_disco_key);
+    if (peer_idx < 0) {
+        ESP_LOGW(TAG, "CallMeMaybe from unknown peer");
+        return;
+    }
+
+    const uint8_t *ep_data = plaintext + 2;
+    size_t ep_data_len = plaintext_len - 2;
+    int ep_count = ep_data_len / 18;
+
+    ESP_LOGD(TAG, "CallMeMaybe from %s: %d endpoints (udp_path=%d, at_sock=%d)",
+             ml->peers[peer_idx].hostname, ep_count,
+             disco_has_udp_path(ml), ml_at_socket_is_ready());
+
+    /* The sender already opened its NAT mapping. Probe it with UDP;
+     * reflecting CallMeMaybe makes two embedded peers exchange it forever. */
+
+    /* Probe each endpoint with a DISCO ping.
+     * Skip on cellular: direct UDP impossible, saves TX queue capacity. */
+    for (int i = 0; !ml_at_socket_is_ready() && i < ep_count && i < ML_MAX_ENDPOINTS; i++) {
+        const uint8_t *entry = ep_data + (i * 18);
+        uint16_t port = (entry[16] << 8) | entry[17];
+
+        /* Check for IPv4-mapped IPv6: ::ffff:A.B.C.D */
+        bool is_v4_mapped = true;
+        for (int j = 0; j < 10; j++) {
+            if (entry[j] != 0) { is_v4_mapped = false; break; }
+        }
+        if (entry[10] != 0xff || entry[11] != 0xff) is_v4_mapped = false;
+
+        ESP_LOGD(TAG, "  CMM ep[%d]: v4mapped=%d port=%d bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+                 i, is_v4_mapped, port,
+                 entry[0], entry[1], entry[2], entry[3],
+                 entry[4], entry[5], entry[6], entry[7],
+                 entry[8], entry[9], entry[10], entry[11],
+                 entry[12], entry[13], entry[14], entry[15]);
+
+        if (!is_v4_mapped || port == 0) continue;
+
+        uint32_t ip = ((uint32_t)entry[12] << 24) |
+                      ((uint32_t)entry[13] << 16) |
+                      ((uint32_t)entry[14] << 8) |
+                      (uint32_t)entry[15];
+
+        /* Send DISCO ping to this endpoint */
+        if (disco_has_udp_path(ml)) {
+            uint8_t ping_pkt[256];
+            size_t ping_len = 0;
+            disco_build_ping(ml, peer_idx, ping_pkt, &ping_len);
+
+            if (ping_len > 0) {
+                int ret = disco_udp_sendto(ml, ping_pkt, ping_len, ip, port);
+                ESP_LOGD(TAG, "CMM probe -> %d.%d.%d.%d:%d (%d bytes, ret=%d)",
+                         (int)((ip >> 24) & 0xFF), (int)((ip >> 16) & 0xFF),
+                         (int)((ip >> 8) & 0xFF), (int)(ip & 0xFF),
+                         (int)port, (int)ping_len, ret);
+            }
+        } else {
+            ESP_LOGW(TAG, "CMM probe skipped: no UDP path (sock4=%d)", ml->disco_sock4);
+        }
+    }
+
+    /* Also force-ping peer's known endpoints from MapResponse */
+    disco_send_ping_to_peer(ml, peer_idx, true);
 }
 
 static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
@@ -1078,77 +1307,7 @@ static void process_disco_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
         process_disco_pong(ml, pkt, sender_disco_key, plaintext, plaintext_len);
         break;
     case DISCO_MSG_CALL_ME_MAYBE:
-        {
-            /* CallMeMaybe: after type(1)+version(1), payload is N x 18-byte entries
-             * Each entry: 16-byte IP (IPv6 or IPv4-mapped) + 2-byte port (big-endian) */
-            int peer_idx = find_peer_by_disco_key(ml, sender_disco_key);
-            if (peer_idx < 0) {
-                ESP_LOGW(TAG, "CallMeMaybe from unknown peer");
-                break;
-            }
-
-            const uint8_t *ep_data = plaintext + 2;
-            size_t ep_data_len = plaintext_len - 2;
-            int ep_count = ep_data_len / 18;
-
-            ESP_LOGD(TAG, "CallMeMaybe from %s: %d endpoints (udp_path=%d, at_sock=%d)",
-                     ml->peers[peer_idx].hostname, ep_count,
-                     disco_has_udp_path(ml), ml_at_socket_is_ready());
-
-            /* Reply with our own CallMeMaybe (bidirectional NAT traversal).
-             * Skip on cellular: our endpoints are behind CGNAT and unreachable. */
-            if (!ml_at_socket_is_ready()) {
-                disco_send_call_me_maybe(ml, peer_idx);
-            }
-
-            /* Probe each endpoint with a DISCO ping.
-             * Skip on cellular: direct UDP impossible, saves TX queue capacity. */
-            for (int i = 0; !ml_at_socket_is_ready() && i < ep_count && i < ML_MAX_ENDPOINTS; i++) {
-                const uint8_t *entry = ep_data + (i * 18);
-                uint16_t port = (entry[16] << 8) | entry[17];
-
-                /* Check for IPv4-mapped IPv6: ::ffff:A.B.C.D */
-                bool is_v4_mapped = true;
-                for (int j = 0; j < 10; j++) {
-                    if (entry[j] != 0) { is_v4_mapped = false; break; }
-                }
-                if (entry[10] != 0xff || entry[11] != 0xff) is_v4_mapped = false;
-
-                ESP_LOGD(TAG, "  CMM ep[%d]: v4mapped=%d port=%d bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-                         i, is_v4_mapped, port,
-                         entry[0], entry[1], entry[2], entry[3],
-                         entry[4], entry[5], entry[6], entry[7],
-                         entry[8], entry[9], entry[10], entry[11],
-                         entry[12], entry[13], entry[14], entry[15]);
-
-                if (!is_v4_mapped || port == 0) continue;
-
-                uint32_t ip = ((uint32_t)entry[12] << 24) |
-                              ((uint32_t)entry[13] << 16) |
-                              ((uint32_t)entry[14] << 8) |
-                              (uint32_t)entry[15];
-
-                /* Send DISCO ping to this endpoint */
-                if (disco_has_udp_path(ml)) {
-                    uint8_t ping_pkt[256];
-                    size_t ping_len = 0;
-                    disco_build_ping(ml, peer_idx, ping_pkt, &ping_len);
-
-                    if (ping_len > 0) {
-                        int ret = disco_udp_sendto(ml, ping_pkt, ping_len, ip, port);
-                        ESP_LOGD(TAG, "CMM probe -> %d.%d.%d.%d:%d (%d bytes, ret=%d)",
-                                 (int)((ip >> 24) & 0xFF), (int)((ip >> 16) & 0xFF),
-                                 (int)((ip >> 8) & 0xFF), (int)(ip & 0xFF),
-                                 (int)port, (int)ping_len, ret);
-                    }
-                } else {
-                    ESP_LOGW(TAG, "CMM probe skipped: no UDP path (sock4=%d)", ml->disco_sock4);
-                }
-            }
-
-            /* Also force-ping peer's known endpoints from MapResponse */
-            disco_send_ping_to_peer(ml, peer_idx, true);
-        }
+        process_disco_call_me_maybe(ml, pkt, sender_disco_key, plaintext, plaintext_len);
         break;
     default:
         ESP_LOGW(TAG, "Unknown DISCO message type: 0x%02x", msg_type);
@@ -1182,7 +1341,7 @@ static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
 
     /* Allocate PBUF_RAM and copy data so the pbuf OWNS its data.
      * This is required because wireguardif decrypts in-place and then
-     * calls ip_input → tcpip_input which posts to the TCPIP thread.
+     * calls the interface input callback, which posts to the TCPIP thread.
      * With PBUF_REF the backing data would be freed before the TCPIP
      * thread processes the packet. */
     struct pbuf *p = pbuf_alloc(PBUF_RAW, pkt->len, PBUF_RAM);
@@ -1204,7 +1363,7 @@ static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
 
     /* Call WG RX handler — pbuf is PBUF_RAM so data survives async delivery.
      * Decrypt may answer a handshake via the raw-udp output cb, and the packet
-     * is injected with tcpip_input, so hold the core lock across it. */
+     * is injected with tcpip_input, so hold lwIP's state across it. */
     bool _wl = ml_lwip_lock();
     wireguardif_network_rx(device, NULL, p, &addr, pkt->src_port);
     ml_lwip_unlock(_wl);
@@ -1458,21 +1617,15 @@ static void disco_periodic_probes(microlink_t *ml) {
         if (p->has_direct_path && now > p->trust_until_ms) {
             ESP_LOGI(TAG, "Direct path to %s expired, reverting to DERP", p->hostname);
             p->has_direct_path = false;
+            p->best_ip = 0;
+            p->best_port = 0;
+            if (ml->wg_netif && p->wg_peer_index >= 0)
+                wireguardif_reset_endpoint((struct netif *)ml->wg_netif,
+                                            (u8_t)p->wg_peer_index);
 
             /* Only do DERP fallback + re-probe for allowed peers.
              * Non-allowed peers just get their state cleaned above. */
             if (peer_allowed) {
-                /* Re-initiate DERP handshake only if we have an active WG session. */
-                if (ml->wg_netif && p->wg_peer_index >= 0) {
-                    struct netif *netif = (struct netif *)ml->wg_netif;
-                    err_t is_up = wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index,
-                                                           NULL, NULL);
-                    if (is_up == ERR_OK) {
-                        wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
-                        ESP_LOGI(TAG, "  WG session active, falling back to DERP for %s", p->hostname);
-                    }
-                }
-
                 /* Force-ping to try re-establishing direct path (WiFi only) */
                 if (!ml_at_socket_is_ready()) {
                     disco_send_ping_to_peer(ml, i, true);
@@ -1532,12 +1685,7 @@ void ml_wg_mgr_task(void *arg) {
     /* Initialize probe tracking */
     memset(pending_probes, 0, sizeof(pending_probes));
 
-    /* Load cached peers from NVS for fast boot */
-    int cached = ml_peer_nvs_load_all(ml->peers, ML_MAX_PEERS);
-    if (cached > 0) {
-        ml->peer_count = cached;
-        ESP_LOGI(TAG, "Pre-loaded %d cached peers from NVS", cached);
-    }
+    /* Never install peer keys from a previous control server or map. */
 
     /* Wait for registration OR shutdown before proceeding */
     EventBits_t wait_bits = xEventGroupWaitBits(ml->events,
@@ -1546,7 +1694,8 @@ void ml_wg_mgr_task(void *arg) {
 
     if (wait_bits & ML_EVT_SHUTDOWN_REQUEST) {
         ESP_LOGI(TAG, "Shutdown requested before registration, exiting");
-        vTaskDelete(NULL);
+        xEventGroupSetBits(ml->events, ML_EVT_WG_MGR_EXITED);
+        vTaskDeleteWithCaps(NULL);
         return;  /* Not reached */
     }
 
@@ -1647,10 +1796,9 @@ void ml_wg_mgr_task(void *arg) {
             }
         }
 
-        /* Run WireGuard periodic processing (handshakes, keepalives, rekeys).
-         * This runs on OUR task stack (8KB) instead of the lwIP TCPIP thread (3-8KB),
-         * preventing heavy crypto (X25519, ChaCha20-Poly1305) from monopolizing
-         * the TCPIP thread and blocking all socket operations system-wide. */
+        /* Run WireGuard periodic processing (handshakes, keepalives, rekeys)
+         * on the manager's 8KB stack. The raw API takes lwIP's state
+         * while it accesses shared peer and crypto state. */
         uint64_t now = ml_get_time_ms();
         if (ml->wg_netif && now - last_wg_periodic_ms >= 400) {
             uint64_t t0 = now;
@@ -1677,23 +1825,22 @@ void ml_wg_mgr_task(void *arg) {
     /* Shutdown WireGuard interface */
     if (ml->wg_netif) {
         struct netif *netif = (struct netif *)ml->wg_netif;
-        {
-            bool _wl = ml_lwip_lock();
-            wireguardif_shutdown(netif);
-            netif_set_link_down(netif);
-            netif_set_down(netif);
-            ml_lwip_unlock(_wl);
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
-        {
-            bool _wl = ml_lwip_lock();
-            netif_remove(netif);
-            ml_lwip_unlock(_wl);
-        }
+        /* Queue teardown behind all decrypted input already posted to lwIP.
+         * A delay or the lwIP state alone cannot retire queued netif pointers. */
+        /* This task's stack is in PSRAM. Keep the semaphore control block
+         * in FreeRTOS's internal heap, as for the other native queues. */
+        wg_shutdown_t shutdown = {.netif = netif};
+        while (!(shutdown.done = xSemaphoreCreateBinary()))
+            vTaskDelay(pdMS_TO_TICKS(10));
+        while (tcpip_callback(wg_shutdown_on_tcpip, &shutdown) != ERR_OK)
+            vTaskDelay(pdMS_TO_TICKS(10));
+        xSemaphoreTake(shutdown.done, portMAX_DELAY);
+        vSemaphoreDelete(shutdown.done);
         free(netif);
         ml->wg_netif = NULL;
     }
 
     ESP_LOGI(TAG, "WG Manager task exiting");
-    vTaskDelete(NULL);
+    xEventGroupSetBits(ml->events, ML_EVT_WG_MGR_EXITED);
+    vTaskDeleteWithCaps(NULL);
 }

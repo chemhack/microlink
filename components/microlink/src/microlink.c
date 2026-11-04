@@ -9,6 +9,7 @@
 #include "microlink_internal.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "freertos/idf_additions.h"
 #include "esp_timer.h"
 #include "esp_mac.h"
 #include "esp_wifi.h"
@@ -17,6 +18,7 @@
 #include "nvs.h"
 #include "cJSON.h"
 #include <string.h>
+#include <time.h>
 #include <stdio.h>
 #include <fcntl.h>
 #include "lwip/sockets.h"
@@ -38,6 +40,7 @@ static const char *TAG = "microlink";
 
 /* X25519 from x25519.h */
 #include "x25519.h"
+#include "nacl_box.h"
 
 /* ============================================================================
  * Key Management (loaded once at init, read-only after)
@@ -53,70 +56,48 @@ static void generate_keypair(uint8_t *private_key, uint8_t *public_key) {
 
 static esp_err_t load_or_generate_keys(microlink_t *ml) {
     nvs_handle_t nvs;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "NVS open failed (%d), generating ephemeral keys", err);
-        generate_keypair(ml->machine_private_key, ml->machine_public_key);
-        generate_keypair(ml->wg_private_key, ml->wg_public_key);
-        generate_keypair(ml->disco_private_key, ml->disco_public_key);
-        return ESP_OK;
+    esp_err_t error = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (error != ESP_OK) return error;
+    const char *names[] = {NVS_KEY_MACHINE_PRI, NVS_KEY_WG_PRI, NVS_KEY_DISCO_PRI};
+    uint8_t *private_keys[] = {ml->machine_private_key, ml->wg_private_key, ml->disco_private_key};
+    uint8_t *public_keys[] = {ml->machine_public_key, ml->wg_public_key, ml->disco_public_key};
+    bool changed = false;
+    for (unsigned i = 0; i < 3 && error == ESP_OK; ++i) {
+        size_t length = 32;
+        error = i == 1 && ml->config.renew_node_key ? ESP_ERR_NVS_NOT_FOUND :
+            nvs_get_blob(nvs, names[i], private_keys[i], &length);
+        if (error == ESP_ERR_NVS_NOT_FOUND) {
+            generate_keypair(private_keys[i], public_keys[i]);
+            error = nvs_set_blob(nvs, names[i], private_keys[i], 32);
+            changed = true;
+        } else if (error == ESP_OK && length == 32) {
+            /* Derive the public key instead of trusting a separate NVS blob. */
+            x25519_base(public_keys[i], private_keys[i], 1);
+        } else if (error == ESP_OK) error = ESP_ERR_INVALID_SIZE;
     }
-
-    size_t key_len = 32;
-    bool need_save = false;
-
-    /* Machine key */
-    if (nvs_get_blob(nvs, NVS_KEY_MACHINE_PRI, ml->machine_private_key, &key_len) != ESP_OK) {
-        generate_keypair(ml->machine_private_key, ml->machine_public_key);
-        need_save = true;
-        ESP_LOGI(TAG, "Generated new machine key");
-    } else {
-        key_len = 32;
-        nvs_get_blob(nvs, NVS_KEY_MACHINE_PUB, ml->machine_public_key, &key_len);
-    }
-
-    /* WireGuard key */
-    key_len = 32;
-    if (nvs_get_blob(nvs, NVS_KEY_WG_PRI, ml->wg_private_key, &key_len) != ESP_OK) {
-        generate_keypair(ml->wg_private_key, ml->wg_public_key);
-        need_save = true;
-        ESP_LOGI(TAG, "Generated new WireGuard key");
-    } else {
-        key_len = 32;
-        nvs_get_blob(nvs, NVS_KEY_WG_PUB, ml->wg_public_key, &key_len);
-    }
-
-    /* DISCO key */
-    key_len = 32;
-    if (nvs_get_blob(nvs, NVS_KEY_DISCO_PRI, ml->disco_private_key, &key_len) != ESP_OK) {
-        generate_keypair(ml->disco_private_key, ml->disco_public_key);
-        need_save = true;
-        ESP_LOGI(TAG, "Generated new DISCO key");
-    } else {
-        key_len = 32;
-        nvs_get_blob(nvs, NVS_KEY_DISCO_PUB, ml->disco_public_key, &key_len);
-    }
-
-    if (need_save) {
-        nvs_set_blob(nvs, NVS_KEY_MACHINE_PRI, ml->machine_private_key, 32);
-        nvs_set_blob(nvs, NVS_KEY_MACHINE_PUB, ml->machine_public_key, 32);
-        nvs_set_blob(nvs, NVS_KEY_WG_PRI, ml->wg_private_key, 32);
-        nvs_set_blob(nvs, NVS_KEY_WG_PUB, ml->wg_public_key, 32);
-        nvs_set_blob(nvs, NVS_KEY_DISCO_PRI, ml->disco_private_key, 32);
-        nvs_set_blob(nvs, NVS_KEY_DISCO_PUB, ml->disco_public_key, 32);
-        nvs_commit(nvs);
-        ESP_LOGI(TAG, "Keys saved to NVS");
-    } else {
-        ESP_LOGI(TAG, "Keys loaded from NVS");
-    }
-
+    if (error == ESP_OK && changed) error = nvs_commit(nvs);
     nvs_close(nvs);
-    return ESP_OK;
+    if (error != ESP_OK) ESP_LOGE(TAG, "Could not load or persist node identity (%d)", error);
+    return error;
 }
 
 /* ============================================================================
  * cJSON PSRAM Hooks
  * ========================================================================== */
+
+/* Queue payloads are used by tasks, including the lwIP thread, and never by
+ * an ISR. Keep FreeRTOS control blocks internal, with payload rings in PSRAM,
+ * to preserve internal RAM for a new WebRTC DTLS handshake while connected. */
+static QueueHandle_t create_psram_queue(microlink_t *ml, unsigned slot,
+                                       UBaseType_t depth, UBaseType_t item_size)
+{
+    ml->queue_storage[slot] = ml_packet_malloc((size_t)depth * item_size);
+    ml->queue_controls[slot] = heap_caps_malloc(sizeof(StaticQueue_t),
+                                               MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!ml->queue_storage[slot] || !ml->queue_controls[slot]) return NULL;
+    return xQueueCreateStatic(depth, item_size, ml->queue_storage[slot],
+                              ml->queue_controls[slot]);
+}
 
 static void *cjson_psram_malloc(size_t size) {
     return ml_psram_malloc(size);
@@ -127,19 +108,22 @@ static void *cjson_psram_malloc(size_t size) {
  * ========================================================================== */
 
 esp_err_t microlink_factory_reset(void) {
-    esp_err_t err;
-
-    /* Erase key namespace */
+    /* Erase key namespace. The caller keeps its log out pending until this
+     * succeeds, so a failure must not report the keys as gone. */
     nvs_handle_t nvs;
-    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
     if (err == ESP_OK) {
-        nvs_erase_all(nvs);
-        nvs_commit(nvs);
+        err = nvs_erase_all(nvs);
+        if (err == ESP_OK) err = nvs_commit(nvs);
         nvs_close(nvs);
-        ESP_LOGI(TAG, "Factory reset: keys erased");
     }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Factory reset: could not erase keys: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(TAG, "Factory reset: keys erased");
 
-    /* Erase cached peers */
+    /* Erase any cache written by older library versions. */
     ml_peer_nvs_init();
     ml_peer_nvs_clear();
     ml_peer_nvs_deinit();
@@ -211,7 +195,7 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     }
 
     /* Initialize peer NVS cache */
-    ml_peer_nvs_init();
+    /* Peer authorization comes from the current control-server map. */
 
     /* Initialize HTTP config server (loads NVS peer allowlist + settings) */
     ml->config_httpd = ml_config_httpd_init();
@@ -280,17 +264,23 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     ml->events = xEventGroupCreate();
     if (!ml->events) {
         ESP_LOGE(TAG, "Failed to create event group");
-        free(ml);
+        microlink_destroy(ml);
+        return NULL;
+    }
+
+    ml->filter_mutex = xSemaphoreCreateMutex();
+    if (!ml->filter_mutex) {
+        microlink_destroy(ml);
         return NULL;
     }
 
     /* Create queues */
-    ml->derp_tx_queue = xQueueCreate(ML_DERP_TX_QUEUE_DEPTH, sizeof(ml_derp_tx_item_t));
-    ml->disco_rx_queue = xQueueCreate(ML_DISCO_RX_QUEUE_DEPTH, sizeof(ml_rx_packet_t));
-    ml->wg_rx_queue = xQueueCreate(ML_WG_RX_QUEUE_DEPTH, sizeof(ml_rx_packet_t));
-    ml->stun_rx_queue = xQueueCreate(ML_STUN_RX_QUEUE_DEPTH, sizeof(ml_rx_packet_t));
-    ml->coord_cmd_queue = xQueueCreate(ML_COORD_CMD_QUEUE_DEPTH, sizeof(ml_coord_cmd_t));
-    ml->peer_update_queue = xQueueCreate(ML_PEER_UPDATE_QUEUE_DEPTH, sizeof(ml_peer_update_t *));
+    ml->derp_tx_queue = create_psram_queue(ml, 0, ML_DERP_TX_QUEUE_DEPTH, sizeof(ml_derp_tx_item_t));
+    ml->disco_rx_queue = create_psram_queue(ml, 1, ML_DISCO_RX_QUEUE_DEPTH, sizeof(ml_rx_packet_t));
+    ml->wg_rx_queue = create_psram_queue(ml, 2, ML_WG_RX_QUEUE_DEPTH, sizeof(ml_rx_packet_t));
+    ml->stun_rx_queue = create_psram_queue(ml, 3, ML_STUN_RX_QUEUE_DEPTH, sizeof(ml_rx_packet_t));
+    ml->coord_cmd_queue = create_psram_queue(ml, 4, ML_COORD_CMD_QUEUE_DEPTH, sizeof(ml_coord_cmd_t));
+    ml->peer_update_queue = create_psram_queue(ml, 5, ML_PEER_UPDATE_QUEUE_DEPTH, sizeof(ml_peer_batch_t *));
 
     if (!ml->derp_tx_queue || !ml->disco_rx_queue || !ml->wg_rx_queue ||
         !ml->stun_rx_queue || !ml->coord_cmd_queue || !ml->peer_update_queue) {
@@ -380,29 +370,32 @@ skip_bsd_socket:
     /* Create tasks */
     BaseType_t ret;
 
-    ret = xTaskCreatePinnedToCore(ml_net_io_task, "ml_net_io", ML_TASK_NET_IO_STACK,
-                                   ml, ML_TASK_NET_IO_PRIO, &ml->net_io_task, ML_TASK_NET_IO_CORE);
+    ret = xTaskCreatePinnedToCoreWithCaps(ml_net_io_task, "ml_net_io", ML_TASK_NET_IO_STACK,
+                                   ml, ML_TASK_NET_IO_PRIO, &ml->net_io_task, ML_TASK_NET_IO_CORE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create net_io task");
         return ESP_FAIL;
     }
 
-    ret = xTaskCreatePinnedToCore(ml_derp_tx_task, "ml_derp_tx", ML_TASK_DERP_TX_STACK,
-                                   ml, ML_TASK_DERP_TX_PRIO, &ml->derp_tx_task, ML_TASK_DERP_TX_CORE);
+    ret = xTaskCreatePinnedToCoreWithCaps(ml_derp_tx_task, "ml_derp_tx", ML_TASK_DERP_TX_STACK,
+                                   ml, ML_TASK_DERP_TX_PRIO, &ml->derp_tx_task, ML_TASK_DERP_TX_CORE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create derp_tx task");
         return ESP_FAIL;
     }
 
-    ret = xTaskCreatePinnedToCore(ml_coord_task, "ml_coord", ML_TASK_COORD_STACK,
-                                   ml, ML_TASK_COORD_PRIO, &ml->coord_task, ML_TASK_COORD_CORE);
+    ret = xTaskCreatePinnedToCoreWithCaps(ml_coord_task, "ml_coord", ML_TASK_COORD_STACK,
+                                   ml, ML_TASK_COORD_PRIO, &ml->coord_task, ML_TASK_COORD_CORE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create coord task");
         return ESP_FAIL;
     }
 
-    ret = xTaskCreatePinnedToCore(ml_wg_mgr_task, "ml_wg_mgr", ML_TASK_WG_MGR_STACK,
-                                   ml, ML_TASK_WG_MGR_PRIO, &ml->wg_mgr_task, ML_TASK_WG_MGR_CORE);
+    /* Peer maps are not written to NVS. The manager runs with the cache
+     * enabled, so its crypto stack need not consume TLS/DMA internal RAM. */
+    ret = xTaskCreatePinnedToCoreWithCaps(ml_wg_mgr_task, "ml_wg_mgr", ML_TASK_WG_MGR_STACK,
+                                   ml, ML_TASK_WG_MGR_PRIO, &ml->wg_mgr_task, ML_TASK_WG_MGR_CORE,
+                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "Failed to create wg_mgr task");
         return ESP_FAIL;
@@ -519,14 +512,27 @@ esp_err_t microlink_stop(microlink_t *ml) {
     if (!ml) return ESP_ERR_INVALID_ARG;
 
     ESP_LOGI(TAG, "Stopping...");
-    xEventGroupSetBits(ml->events, ML_EVT_SHUTDOWN_REQUEST);
+    ml->peer_map_valid = false;
+    if (ml->events) xEventGroupSetBits(ml->events, ML_EVT_SHUTDOWN_REQUEST);
 
-    /* Wait for tasks to exit (they check ML_EVT_SHUTDOWN_REQUEST).
-     * Tasks call vTaskDelete(NULL) to self-delete, so we must NOT call
-     * vTaskDelete() on them again — that causes a crash in uxListRemove
-     * because the task's list node is already invalid. Just wait and
-     * NULL the handles. */
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    EventBits_t required = 0;
+    if (ml->net_io_task) required |= ML_EVT_NET_IO_EXITED;
+    if (ml->derp_tx_task) required |= ML_EVT_DERP_TX_EXITED;
+    if (ml->coord_task) required |= ML_EVT_COORD_EXITED;
+    if (ml->wg_mgr_task) required |= ML_EVT_WG_MGR_EXITED;
+    /* Wake queue waits and socket reads. Workers retain ownership of close(). */
+    ml_coord_cmd_t wake = ML_CMD_DISCONNECT;
+    if (ml->coord_cmd_queue) xQueueSend(ml->coord_cmd_queue, &wake, 0);
+    if (ml->coord_sock >= 0) shutdown(ml->coord_sock, SHUT_RDWR);
+    if (ml->derp.sockfd >= 0) shutdown(ml->derp.sockfd, SHUT_RDWR);
+    if (required) {
+        EventBits_t exited = xEventGroupWaitBits(ml->events, required,
+            pdFALSE, pdTRUE, pdMS_TO_TICKS(30000));
+        if ((exited & required) != required) {
+            ESP_LOGE(TAG, "Workers still stopping; keeping their resources alive");
+            return ESP_ERR_TIMEOUT;
+        }
+    }
 
     ml->net_io_task = NULL;
     ml->derp_tx_task = NULL;
@@ -556,7 +562,7 @@ esp_err_t microlink_stop(microlink_t *ml) {
 void microlink_destroy(microlink_t *ml) {
     if (!ml) return;
 
-    microlink_stop(ml);
+    if (microlink_stop(ml) != ESP_OK) return;
 
     /* Deinitialize peer NVS */
     ml_peer_nvs_deinit();
@@ -567,6 +573,16 @@ void microlink_destroy(microlink_t *ml) {
         ml->config_httpd = NULL;
     }
 
+    /* Pending packets still own PSRAM payloads after producers exit. */
+    ml_derp_tx_item_t tx;
+    while (ml->derp_tx_queue && xQueueReceive(ml->derp_tx_queue, &tx, 0)) free(tx.data);
+    ml_rx_packet_t rx;
+    QueueHandle_t rx_queues[] = {ml->disco_rx_queue, ml->wg_rx_queue, ml->stun_rx_queue};
+    for (unsigned i = 0; i < sizeof(rx_queues) / sizeof(rx_queues[0]); ++i)
+        while (rx_queues[i] && xQueueReceive(rx_queues[i], &rx, 0)) free(rx.data);
+    ml_peer_batch_t *batch;
+    while (ml->peer_update_queue && xQueueReceive(ml->peer_update_queue, &batch, 0)) free(batch);
+
     /* Delete queues */
     if (ml->derp_tx_queue) vQueueDelete(ml->derp_tx_queue);
     if (ml->disco_rx_queue) vQueueDelete(ml->disco_rx_queue);
@@ -574,14 +590,22 @@ void microlink_destroy(microlink_t *ml) {
     if (ml->stun_rx_queue) vQueueDelete(ml->stun_rx_queue);
     if (ml->coord_cmd_queue) vQueueDelete(ml->coord_cmd_queue);
     if (ml->peer_update_queue) vQueueDelete(ml->peer_update_queue);
+    for (unsigned i = 0; i < 6; ++i) {
+        free(ml->queue_storage[i]);
+        free(ml->queue_controls[i]);
+    }
 
     /* Delete event group */
     if (ml->events) vEventGroupDelete(ml->events);
+    cJSON_Delete(ml->packet_filters);
+    ml_peer_dir_free(&ml->peer_dir);
+    if (ml->filter_mutex) vSemaphoreDelete(ml->filter_mutex);
 
     /* Clear keys from memory */
     memset(ml->machine_private_key, 0, 32);
     memset(ml->wg_private_key, 0, 32);
     memset(ml->disco_private_key, 0, 32);
+    nacl_box_forget();
 
     free(ml);
     ESP_LOGI(TAG, "Destroyed");
@@ -596,7 +620,11 @@ microlink_state_t microlink_get_state(const microlink_t *ml) {
 }
 
 bool microlink_is_connected(const microlink_t *ml) {
-    return ml && ml->state == ML_STATE_CONNECTED;
+    /* Without the WireGuard interface no packet can pass, whatever the
+     * control server says. The tunnel does not need the control connection:
+     * while the client connects to the control server again, it keeps its
+     * peer map and passes packets. microlink_stop clears peer_map_valid. */
+    return ml && ml->peer_map_valid && ml->wg_netif;
 }
 
 uint32_t microlink_get_vpn_ip(const microlink_t *ml) {
@@ -612,11 +640,21 @@ int microlink_get_peer_count(const microlink_t *ml) {
 }
 
 int64_t microlink_get_key_expiry(const microlink_t *ml) {
-    return ml ? ml->key_expiry_epoch : 0;
+    if (!ml || xSemaphoreTake(ml->filter_mutex, pdMS_TO_TICKS(20)) != pdTRUE) return 0;
+    int64_t expiry = ml->key_lifetime.expiry_epoch;
+    xSemaphoreGive(ml->filter_mutex);
+    return expiry;
+}
+
+unsigned microlink_peers_left_out(const microlink_t *ml) {
+    return ml ? ml->peers_left_out : 0;
 }
 
 bool microlink_key_expired(const microlink_t *ml) {
-    return ml ? ml->key_expired : false;
+    if (!ml || xSemaphoreTake(ml->filter_mutex, pdMS_TO_TICKS(20)) != pdTRUE) return true;
+    bool expired = ml_key_expiry_expired(&ml->key_lifetime, ml_get_time_ms(), (int64_t)time(NULL));
+    xSemaphoreGive(ml->filter_mutex);
+    return expired;
 }
 
 esp_err_t microlink_get_peer_info(const microlink_t *ml, int index, microlink_peer_info_t *info) {

@@ -173,7 +173,7 @@ microlink_udp_socket_t *microlink_udp_create(microlink_t *ml, uint16_t local_por
     ip_addr_t local_ip;
     ip_to_lwip(ml->vpn_ip, &local_ip);
 
-    /* Raw lwIP pcb setup, under the core lock (see ml_lwip_lock.h). */
+    /* Raw lwIP pcb setup, while the task holds lwIP's state (see ml_lwip_lock.h). */
     bool _l = ml_lwip_lock();
     sock->pcb = udp_new();
     if (!sock->pcb) {

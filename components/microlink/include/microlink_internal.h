@@ -21,6 +21,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "ml_packet_filter.h"
+#include "ml_key_expiry.h"
+#include "ml_derp_stream.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "mbedtls/ssl.h"
@@ -52,26 +56,32 @@ extern "C" {
  * that the browser times out. The relative order here is preserved: the
  * RX-latency tasks (net_io, wg_mgr) sit above the throughput tasks (derp_tx,
  * coord). */
-/* All MicroLink tasks are pinned to core 1, leaving core 0 for an application's
- * real-time work so the tunnel cannot steal cycles from it. */
+/* All MicroLink tasks are pinned to core 0. On the JetKVM Mini core 1 runs
+ * HDMI capture, the H.264 encoder and the WebRTC peer task (priority 6),
+ * which also encrypts the tunnel's outgoing packets; on core 1 the tunnel's
+ * receive tasks waited behind the peer task's sends, and keys over the
+ * tunnel arrived late while the Mini read an HTTPS image. */
 #define ML_TASK_NET_IO_STACK    (8 * 1024)
 #define ML_TASK_NET_IO_PRIO     4
-#define ML_TASK_NET_IO_CORE     1
+#define ML_TASK_NET_IO_CORE     0
 
 #define ML_TASK_DERP_TX_STACK   (14 * 1024)
 #define ML_TASK_DERP_TX_PRIO    3
-#define ML_TASK_DERP_TX_CORE    1
+#define ML_TASK_DERP_TX_CORE    0
 
 #define ML_TASK_COORD_STACK     (12 * 1024)
 #define ML_TASK_COORD_PRIO      3
-#define ML_TASK_COORD_CORE      1
+#define ML_TASK_COORD_CORE      0
 
 #define ML_TASK_WG_MGR_STACK    (8 * 1024)
 #define ML_TASK_WG_MGR_PRIO     4
-#define ML_TASK_WG_MGR_CORE     1
+#define ML_TASK_WG_MGR_CORE     0
 
 /* Queue depths */
-#define ML_DERP_TX_QUEUE_DEPTH  16
+/* A maximum 512 KiB encoded keyframe needs roughly 400 MTU datagrams.
+ * Keep its bounded burst in PSRAM while the relay worker gets scheduled.
+ * Congestion after that reports backpressure instead of evicting old data. */
+#define ML_DERP_TX_QUEUE_DEPTH  512
 #define ML_DISCO_RX_QUEUE_DEPTH 16
 /* Deep enough to hold a TCP window's worth of packets while the manager task
  * is busy with a handshake or a DISCO probe round. The enqueue in
@@ -81,6 +91,7 @@ extern "C" {
 #define ML_WG_RX_QUEUE_DEPTH    64
 #define ML_STUN_RX_QUEUE_DEPTH  4
 #define ML_COORD_CMD_QUEUE_DEPTH 4
+/* Map responses, one ml_peer_batch_t each, whatever their number of peers. */
 #define ML_PEER_UPDATE_QUEUE_DEPTH 400
 
 /* Protocol limits */
@@ -123,6 +134,7 @@ extern "C" {
 /* Control plane timing */
 #define ML_CTRL_WATCHDOG_MS             120000
 #define ML_CTRL_BACKOFF_MAX_MS          30000
+#define ML_CTRL_LOGIN_POLL_MS           3000
 #define ML_CTRL_KEEPALIVE_MS            60000
 
 /* Large tailnet buffer sizes (PSRAM-allocated, configurable via menuconfig) */
@@ -197,6 +209,10 @@ typedef struct {
 #define ML_EVT_SHUTDOWN_REQUEST     BIT6
 #define ML_EVT_DERP_RECONNECT       BIT7
 #define ML_EVT_DERP_CONNECT_REQ     BIT8
+#define ML_EVT_NET_IO_EXITED        BIT9
+#define ML_EVT_DERP_TX_EXITED       BIT10
+#define ML_EVT_COORD_EXITED         BIT11
+#define ML_EVT_WG_MGR_EXITED        BIT12
 
 /* ============================================================================
  * Queue Message Types
@@ -228,26 +244,9 @@ typedef enum {
     ML_CMD_FORCE_RECONNECT,     /* Force reconnection (after DERP failure, etc.) */
 } ml_coord_cmd_t;
 
-/* Peer update (from coord to wg_mgr) */
-typedef struct {
-    enum {
-        ML_PEER_ADD,
-        ML_PEER_REMOVE,
-        ML_PEER_UPDATE_ENDPOINT,
-    } action;
-    uint32_t vpn_ip;
-    uint8_t public_key[32];
-    uint8_t disco_key[32];
-    char hostname[64];
-    uint16_t derp_region;
-    /* Endpoints */
-    struct {
-        uint32_t ip;
-        uint16_t port;
-        bool is_ipv6;
-    } endpoints[ML_MAX_ENDPOINTS];
-    int endpoint_count;
-} ml_peer_update_t;
+/* Peer map messages are also used by the host protocol regression tests. */
+#include "ml_peer_map.h"
+#include "ml_peer_select.h"
 
 /* ============================================================================
  * Peer State (owned exclusively by wg_mgr task)
@@ -255,6 +254,7 @@ typedef struct {
 
 typedef struct {
     /* Identity */
+    uint64_t node_id;
     uint32_t vpn_ip;
     uint8_t public_key[32];
     uint8_t disco_key[32];
@@ -342,6 +342,7 @@ typedef struct {
     mbedtls_ssl_config ssl_conf;
     bool connected;
     uint64_t last_recv_ms;          /* For keepalive watchdog */
+    ml_derp_stream_t stream;        /* Pending non-blocking frame I/O */
 } ml_derp_conn_t;
 
 /* ============================================================================
@@ -361,6 +362,9 @@ struct microlink_s {
 
     /* Event group (cross-task synchronization) */
     EventGroupHandle_t events;
+    SemaphoreHandle_t filter_mutex;
+    cJSON *packet_filters;
+    ml_udp_flows_t udp_flows;
 
     /* Task handles */
     TaskHandle_t net_io_task;
@@ -370,11 +374,15 @@ struct microlink_s {
 
     /* Queues */
     QueueHandle_t derp_tx_queue;        /* -> derp_tx task */
+    uint32_t derp_tx_queue_dropped;
+    uint32_t derp_tx_queue_peak;
     QueueHandle_t disco_rx_queue;       /* net_io -> wg_mgr */
     QueueHandle_t wg_rx_queue;          /* net_io -> wg_mgr */
     QueueHandle_t stun_rx_queue;        /* net_io -> coord */
     QueueHandle_t coord_cmd_queue;      /* any -> coord */
     QueueHandle_t peer_update_queue;    /* coord -> wg_mgr */
+    uint8_t *queue_storage[6];
+    StaticQueue_t *queue_controls[6];
 
     /* Keys (loaded at init, read-only after) */
     uint8_t machine_private_key[32];    /* Noise machine key */
@@ -410,6 +418,13 @@ struct microlink_s {
 
     /* Peers (owned exclusively by wg_mgr task) */
     ml_peer_t peers[ML_MAX_PEERS];
+    volatile bool peer_map_valid;
+    volatile unsigned peer_map_generation, peer_map_failed_generation;
+    /* Every live peer; the peers above hold the slots of those it ranks
+     * first. */
+    ml_peer_dir_t peer_dir;
+    /* Live peers without a slot, after the last selection. */
+    volatile unsigned peers_left_out;
     int peer_count;
 
     /* STUN results (written by coord, read by coord only) */
@@ -442,8 +457,8 @@ struct microlink_s {
     bool derp_home_probed;          /* latency probe / selection has run once */
 
     /* Key expiry (parsed from MapResponse self-node) */
-    int64_t key_expiry_epoch;       /* Unix epoch seconds, 0 = no expiry */
-    bool key_expired;               /* true if Node.Expired == true */
+    ml_key_expiry_t key_lifetime;   /* Protected by filter_mutex. */
+    bool registration_completed;    /* Do not send a consumed auth key on reconnect. */
 
     /* Resolved timing (set during init from config, 0 = default) */
     uint32_t t_disco_heartbeat_ms;
@@ -697,6 +712,16 @@ static inline ssize_t ml_read_sock(int fd, void *buf, size_t len) {
 #define ml_write_sock   write
 #define ml_read_sock    read
 #endif /* CONFIG_ML_ENABLE_CELLULAR */
+
+/* Packet queues must not consume internal TLS/video reserves if PSRAM fills.
+ * Boards without PSRAM retain their normal allocator. */
+static inline void *ml_packet_malloc(size_t size) {
+#if CONFIG_SPIRAM
+    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#else
+    return malloc(size);
+#endif
+}
 
 /* PSRAM allocation helper */
 static inline void *ml_psram_malloc(size_t size) {

@@ -8,7 +8,12 @@
 
 #include "nacl_box.h"
 #include "x25519.h"
+#include <stdbool.h>
 #include <string.h>
+#include <sys/lock.h>
+
+#include "esp_attr.h"
+#include "sdkconfig.h"
 
 /* Debug logging - set to 1 to enable */
 #define NACL_BOX_DEBUG 0
@@ -547,6 +552,67 @@ int nacl_box_afternm(uint8_t *ciphertext,
     return secretbox(ciphertext, plaintext, plaintext_len, nonce, shared_key);
 }
 
+/* The shared key of a box depends only on the two keys, and one X25519 takes
+ * milliseconds on the Mini. Disco seals and opens several messages a second
+ * for each peer, so the shared keys of the most recent key pairs are kept, one
+ * for each peer the client can hold and one for the DERP server, and each pair
+ * costs one X25519. */
+#ifdef CONFIG_ML_MAX_PEERS
+#define NACL_SHARED_KEYS (CONFIG_ML_MAX_PEERS + 1)
+#else
+#define NACL_SHARED_KEYS 8
+#endif
+
+typedef struct {
+    bool valid;
+    uint32_t used;
+    uint8_t public_key[32];
+    uint8_t secret_key[32];
+    uint8_t shared_key[32];
+} nacl_shared_entry_t;
+
+static EXT_RAM_BSS_ATTR nacl_shared_entry_t s_shared[NACL_SHARED_KEYS];
+static uint32_t s_shared_clock;
+static _lock_t s_shared_lock;
+
+static void nacl_shared_key(uint8_t *shared_key, const uint8_t *public_key, const uint8_t *secret_key) {
+    _lock_acquire(&s_shared_lock);
+    for (int i = 0; i < NACL_SHARED_KEYS; i++) {
+        nacl_shared_entry_t *e = &s_shared[i];
+        if (e->valid && memcmp(e->public_key, public_key, 32) == 0 &&
+            memcmp(e->secret_key, secret_key, 32) == 0) {
+            e->used = ++s_shared_clock;
+            memcpy(shared_key, e->shared_key, 32);
+            _lock_release(&s_shared_lock);
+            return;
+        }
+    }
+    _lock_release(&s_shared_lock);
+
+    nacl_box_beforenm(shared_key, public_key, secret_key);
+
+    _lock_acquire(&s_shared_lock);
+    nacl_shared_entry_t *slot = &s_shared[0];
+    for (int i = 0; i < NACL_SHARED_KEYS; i++) {
+        if (!s_shared[i].valid) { slot = &s_shared[i]; break; }
+        if (s_shared[i].used < slot->used) slot = &s_shared[i];
+    }
+    slot->valid = true;
+    slot->used = ++s_shared_clock;
+    memcpy(slot->public_key, public_key, 32);
+    memcpy(slot->secret_key, secret_key, 32);
+    memcpy(slot->shared_key, shared_key, 32);
+    _lock_release(&s_shared_lock);
+}
+
+void nacl_box_forget(void) {
+    _lock_acquire(&s_shared_lock);
+    volatile uint8_t *bytes = (volatile uint8_t *)s_shared;
+    for (size_t i = 0; i < sizeof(s_shared); i++) bytes[i] = 0;
+    s_shared_clock = 0;
+    _lock_release(&s_shared_lock);
+}
+
 int nacl_box(uint8_t *ciphertext,
              const uint8_t *plaintext, size_t plaintext_len,
              const uint8_t *nonce,
@@ -554,7 +620,7 @@ int nacl_box(uint8_t *ciphertext,
              const uint8_t *sender_sk) {
     uint8_t shared_key[32];
 
-    nacl_box_beforenm(shared_key, recipient_pk, sender_sk);
+    nacl_shared_key(shared_key, recipient_pk, sender_sk);
     int ret = nacl_box_afternm(ciphertext, plaintext, plaintext_len, nonce, shared_key);
 
     memset(shared_key, 0, sizeof(shared_key));
@@ -695,7 +761,7 @@ int nacl_box_open(uint8_t *plaintext,
                   const uint8_t *recipient_sk) {
     uint8_t shared_key[32];
 
-    nacl_box_beforenm(shared_key, sender_pk, recipient_sk);
+    nacl_shared_key(shared_key, sender_pk, recipient_sk);
     int ret = nacl_box_open_afternm(plaintext, ciphertext, ciphertext_len, nonce, shared_key);
 
     memset(shared_key, 0, sizeof(shared_key));

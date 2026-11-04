@@ -25,7 +25,10 @@ typedef struct microlink_s microlink_t;
 
 /* Configuration */
 typedef struct {
+    void (*auth_callback)(const char *url, const char *error, void *ctx);
+    void *auth_callback_ctx;
     const char *auth_key;       /* Tailscale auth key (tskey-auth-...) */
+    bool renew_node_key;        /* New enrollment or explicit reauthentication */
     const char *device_name;    /* Device hostname on the tailnet */
     bool enable_derp;           /* Enable DERP relay (default: true) */
     bool enable_stun;           /* Enable STUN endpoint discovery */
@@ -205,6 +208,15 @@ int64_t microlink_get_key_expiry(const microlink_t *ml);
  * @brief Whether the control plane has already declared the key expired
  */
 bool microlink_key_expired(const microlink_t *ml);
+
+/**
+ * @brief The live peers of the tailnet that have no WireGuard slot
+ *
+ * A tailnet with more live peers than CONFIG_ML_MAX_PEERS gives the slots
+ * to the peers with a session, then the online ones, then the most recently
+ * seen; the peers left out cannot reach this node.
+ */
+unsigned microlink_peers_left_out(const microlink_t *ml);
 
 /**
  * @brief Get peer info by index

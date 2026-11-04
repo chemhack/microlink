@@ -211,6 +211,10 @@ struct wireguard_device {
 	// Force all peer output through DERP relay (cellular mode)
 	bool force_derp_output;
 
+	// Initiations that reached X25519 in the current one-second window
+	uint32_t initiation_window_millis;
+	uint32_t initiation_window_count;
+
 	bool valid;
 };
 

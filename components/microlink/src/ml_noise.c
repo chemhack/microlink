@@ -309,9 +309,8 @@ esp_err_t ml_noise_write_msg1(ml_noise_state_t *state, uint8_t *out, size_t *out
     memset(dh_output, 0, 32);
 
     /* s: Encrypt and send static public key (32 + 16 MAC = 48 bytes) */
-    chacha20poly1305_encrypt(k, 0, state->h, 32,
-                              state->local_static_public, 32,
-                              out + pos);
+    if (chacha20poly1305_encrypt(k, 0, state->h, 32,
+            state->local_static_public, 32, out + pos) < 0) return ESP_FAIL;
     noise_mix_hash(state->h, out + pos, 48);
     pos += 48;
 
@@ -321,8 +320,8 @@ esp_err_t ml_noise_write_msg1(ml_noise_state_t *state, uint8_t *out, size_t *out
     memset(dh_output, 0, 32);
 
     /* Empty payload encrypted (just the 16-byte auth tag) */
-    chacha20poly1305_encrypt(k, 0, state->h, 32,
-                              NULL, 0, out + pos);
+    if (chacha20poly1305_encrypt(k, 0, state->h, 32,
+            NULL, 0, out + pos) < 0) return ESP_FAIL;
     noise_mix_hash(state->h, out + pos, 16);
     pos += 16;
 

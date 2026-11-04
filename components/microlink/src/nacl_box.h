@@ -43,6 +43,14 @@ int nacl_box(uint8_t *ciphertext,
  * @param sender_sk Sender's secret key
  * @return 0 on success, -1 on failure
  */
+/**
+ * @brief Erase the shared keys that nacl_box() and nacl_box_open() keep
+ *
+ * The kept entries hold copies of the secret keys; the client calls this
+ * when it erases its own keys.
+ */
+void nacl_box_forget(void);
+
 int nacl_box_beforenm(uint8_t *shared_key,
                       const uint8_t *recipient_pk,
                       const uint8_t *sender_sk);

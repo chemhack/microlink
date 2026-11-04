@@ -34,6 +34,7 @@
 #ifndef _WIREGUARDIF_H_
 #define _WIREGUARDIF_H_
 
+#include <stdbool.h>
 #include "lwip/arch.h"
 #include "lwip/netif.h"
 #include "lwip/ip_addr.h"
@@ -105,6 +106,12 @@ struct wireguardif_peer {
  */
 
 // Initialise a new WireGuard network interface (netif)
+/* Takes the lwIP state that the raw API changes, from a task other than the
+ * TCP/IP thread; returns whether it took it, which wireguardif_lwip_unlock()
+ * gets back. A thread that already has the state takes nothing. */
+bool wireguardif_lwip_lock(void);
+void wireguardif_lwip_unlock(bool acquired);
+
 err_t wireguardif_init(struct netif *netif);
 
 // Helper to initialise the peer struct with defaults
@@ -120,6 +127,13 @@ err_t wireguardif_remove_peer(struct netif *netif, u8_t peer_index);
 // Update the "connect" IP of the given peer
 err_t wireguardif_update_endpoint(struct netif *netif, u8_t peer_index, const ip_addr_t *ip, u16_t port);
 
+// Retire both direct endpoints without changing the peer's established session.
+// Data uses DERP until a new direct path is validated.
+err_t wireguardif_reset_endpoint(struct netif *netif, u8_t peer_index);
+/* Install a validated path without replacing an established crypto session. */
+err_t wireguardif_roam_endpoint(struct netif *netif, u8_t peer_index,
+                               const ip_addr_t *ip, u16_t port);
+
 // Try and connect to the given peer
 err_t wireguardif_connect(struct netif *netif, u8_t peer_index);
 
@@ -128,6 +142,10 @@ err_t wireguardif_disconnect(struct netif *netif, u8_t peer_index);
 
 // Is the given peer "up"? A peer is up if it has a valid session key it can communicate with
 err_t wireguardif_peer_is_up(struct netif *netif, u8_t peer_index, ip_addr_t *current_ip, u16_t *current_port);
+
+// Does the given peer have a session in use? Only a keypair younger than REJECT_AFTER_TIME counts:
+// an expired previous keypair stays valid until the next handshake replaces it
+bool wireguardif_peer_has_session(struct netif *netif, u8_t peer_index);
 
 // Register a DERP relay output callback for peers without direct endpoints
 // This callback is invoked when a WireGuard packet needs to be sent to a peer

@@ -1,12 +1,19 @@
 set(SRCS
     "src/microlink.c"
+    "src/ml_packet_filter.c"
+    "src/ml_peer_map.c"
+    "src/ml_peer_select.c"
+    "src/ml_timestamp.c"
+    "src/ml_key_expiry.c"
     "src/ml_coord.c"
     "src/ml_derp.c"
+    "src/ml_derp_stream.c"
     "src/ml_net_io.c"
     "src/ml_wg_mgr.c"
     "src/ml_stun.c"
     "src/ml_noise.c"
     "src/ml_h2.c"
+    "src/ml_h2_message.c"
     "src/ml_udp.c"
     "src/ml_tcp.c"
     "src/ml_peer_nvs.c"
@@ -33,6 +40,8 @@ set(REQUIRES
     esp_driver_gpio
     esp_driver_tsens
     esp_http_server
+    esp_http_client
+    esp-tls
 )
 
 idf_component_register(
@@ -50,3 +59,19 @@ idf_component_register(
 # although the terminator is written on the next line every time. Forty such
 # copies in this component; a warning per inlining site is noise, not a bug.
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-stringop-truncation)
+
+# Compile the pinned project cJSON with private symbols. Its allocations use
+# MicroLink's PSRAM hooks; RPC and other firmware keep their own allocator.
+idf_component_get_property(_ml_cjson_dir espressif__cjson COMPONENT_DIR)
+set(_ml_cjson_source "${CMAKE_CURRENT_BINARY_DIR}/private_cjson.c")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/generate_cjson.py" "${_ml_cjson_dir}/cJSON/cJSON.c")
+execute_process(COMMAND "${PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/generate_cjson.py"
+    "${_ml_cjson_dir}/cJSON/cJSON.c" "${_ml_cjson_source}"
+    RESULT_VARIABLE _ml_cjson_result)
+if(NOT _ml_cjson_result EQUAL 0)
+    message(FATAL_ERROR "Could not prepare the private Tailscale JSON parser")
+endif()
+target_sources(${COMPONENT_LIB} PRIVATE "${_ml_cjson_source}")
+target_compile_options(${COMPONENT_LIB} PRIVATE
+    -include "${CMAKE_CURRENT_SOURCE_DIR}/include/ml_json_namespace.h")

@@ -556,6 +556,18 @@ uint8_t wireguard_get_message_type(const uint8_t *data, size_t len) {
 	return result;
 }
 
+static bool initiation_within_budget(struct wireguard_device *device, uint32_t now) {
+	if ((now - device->initiation_window_millis) >= 1000) {
+		device->initiation_window_millis = now;
+		device->initiation_window_count = 0;
+	}
+	if (device->initiation_window_count >= MAX_DEVICE_INITIATIONS_PER_SECOND) {
+		return false;
+	}
+	device->initiation_window_count++;
+	return true;
+}
+
 struct wireguard_peer *wireguard_process_initiation_message(struct wireguard_device *device, struct message_handshake_initiation *msg) {
 	struct wireguard_peer *ret_peer = NULL;
 	struct wireguard_peer *peer = NULL;
@@ -570,6 +582,10 @@ struct wireguard_peer *wireguard_process_initiation_message(struct wireguard_dev
 	uint32_t now;
 	bool rate_limit;
 	bool replay;
+
+	if (!initiation_within_budget(device, wireguard_sys_now())) {
+		return NULL;
+	}
 
 	// We are the responder, other end is the initiator
 
@@ -619,7 +635,7 @@ struct wireguard_peer *wireguard_process_initiation_message(struct wireguard_dev
 
 					// Check that timestamp is increasing and we haven't had too many initiations (should only get one per peer every 5 seconds max?)
 					replay = (memcmp(t, peer->greatest_timestamp, WIREGUARD_TAI64N_LEN) <= 0); // tai64n is big endian so we can use memcmp to compare
-					rate_limit = (peer->last_initiation_rx - now) < (1000 / MAX_INITIATIONS_PER_SECOND);
+					rate_limit = (now - peer->last_initiation_rx) < (1000 / MAX_INITIATIONS_PER_SECOND);
 
 					if (!replay && !rate_limit) {
 						// Success! Copy everything to peer

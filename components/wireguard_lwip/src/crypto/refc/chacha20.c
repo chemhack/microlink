@@ -90,53 +90,87 @@ static inline void INNER_BLOCK(uint32_t *block) {
 )
 
 // 2.3.  The ChaCha20 Block Function
-// chacha20_block(key, counter, nonce):
-//  state = constants | key | counter | nonce
-//  working_state = state
-//	for i=1 upto 10
-//   inner_block(working_state)
-//  end
-//	state += working_state
-//	return serialize(state)
-// end
-static void chacha20_block(struct chacha20_ctx *ctx, uint8_t *stream) {
-	uint32_t working_state[16];
-	int i;
+// The working state stays in sixteen local words so that the compiler keeps
+// it in registers through the twenty rounds; the result is the keystream as
+// words, which the caller XORs into the data a word at a time.
+#define QR(a, b, c, d) \
+	a += b; d ^= a; d = ROTL32(d, 16); \
+	c += d; b ^= c; b = ROTL32(b, 12); \
+	a += b; d ^= a; d = ROTL32(d,  8); \
+	c += d; b ^= c; b = ROTL32(b,  7)
 
-	for (i = 0; i < 16; ++i) {
-		working_state[i] = ctx->state[i];
+static void chacha20_block_words(const uint32_t *s, uint32_t *ks) {
+	uint32_t x0 = s[0], x1 = s[1], x2 = s[2], x3 = s[3];
+	uint32_t x4 = s[4], x5 = s[5], x6 = s[6], x7 = s[7];
+	uint32_t x8 = s[8], x9 = s[9], x10 = s[10], x11 = s[11];
+	uint32_t x12 = s[12], x13 = s[13], x14 = s[14], x15 = s[15];
+	for (int i = 0; i < 10; ++i) {
+		QR(x0, x4, x8, x12);
+		QR(x1, x5, x9, x13);
+		QR(x2, x6, x10, x14);
+		QR(x3, x7, x11, x15);
+		QR(x0, x5, x10, x15);
+		QR(x1, x6, x11, x12);
+		QR(x2, x7, x8, x13);
+		QR(x3, x4, x9, x14);
 	}
-
-	TWENTY_ROUNDS(working_state);
-
-	for (i = 0; i < 16; ++i) {
-		U32TO8_LITTLE(stream + (4 * i), PLUS(working_state[i], ctx->state[i]));
-	}
+	ks[0] = x0 + s[0];   ks[1] = x1 + s[1];   ks[2] = x2 + s[2];   ks[3] = x3 + s[3];
+	ks[4] = x4 + s[4];   ks[5] = x5 + s[5];   ks[6] = x6 + s[6];   ks[7] = x7 + s[7];
+	ks[8] = x8 + s[8];   ks[9] = x9 + s[9];   ks[10] = x10 + s[10]; ks[11] = x11 + s[11];
+	ks[12] = x12 + s[12]; ks[13] = x13 + s[13]; ks[14] = x14 + s[14]; ks[15] = x15 + s[15];
 }
 
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#define CHACHA20_WORD_XOR 1
+#else
+#define CHACHA20_WORD_XOR 0
+#endif
+
 void chacha20(struct chacha20_ctx *ctx, uint8_t *out, const uint8_t *in, uint32_t len) {
-	uint8_t output[CHACHA20_BLOCK_SIZE];
+	uint32_t ks[16];
+	uint8_t tail[CHACHA20_BLOCK_SIZE];
 	int i;
 
-	if (len) {
-		for (;;) {
-			chacha20_block(ctx, output);
-			// Word 12 is a block counter
-			ctx->state[12] = PLUSONE(ctx->state[12]);
-			if (len <= 64) {
-				for (i = 0;i < len;++i) {
-					out[i] = in[i] ^ output[i];
-			    }
-			    return;
+	while (len >= CHACHA20_BLOCK_SIZE) {
+		chacha20_block_words(ctx->state, ks);
+		// Word 12 is a block counter
+		ctx->state[12] = PLUSONE(ctx->state[12]);
+#if CHACHA20_WORD_XOR
+		if ((((uintptr_t)in | (uintptr_t)out) & 3) == 0) {
+			// A WireGuard packet is encrypted in place at a word-aligned offset,
+			// so the keystream is applied a word at a time.
+			const uint8_t *ia = __builtin_assume_aligned(in, 4);
+			uint8_t *oa = __builtin_assume_aligned(out, 4);
+			for (i = 0; i < 16; ++i) {
+				uint32_t w;
+				memcpy(&w, ia + 4 * i, 4);
+				w ^= ks[i];
+				memcpy(oa + 4 * i, &w, 4);
 			}
-			for (i = 0;i < 64;++i) {
-				out[i] = in[i] ^ output[i];
+		} else
+#endif
+		{
+			for (i = 0; i < 16; ++i) {
+				uint32_t w = U8TO32_LITTLE(in + 4 * i) ^ ks[i];
+				U32TO8_LITTLE(out + 4 * i, w);
 			}
-			len -= 64;
-			out += 64;
-			in += 64;
 		}
+		len -= CHACHA20_BLOCK_SIZE;
+		out += CHACHA20_BLOCK_SIZE;
+		in += CHACHA20_BLOCK_SIZE;
 	}
+	if (len) {
+		chacha20_block_words(ctx->state, ks);
+		ctx->state[12] = PLUSONE(ctx->state[12]);
+		for (i = 0; i < 16; ++i) {
+			U32TO8_LITTLE(tail + 4 * i, ks[i]);
+		}
+		for (i = 0; i < (int)len; ++i) {
+			out[i] = in[i] ^ tail[i];
+		}
+		crypto_zero(tail, sizeof(tail));
+	}
+	crypto_zero(ks, sizeof(ks));
 }
 
 

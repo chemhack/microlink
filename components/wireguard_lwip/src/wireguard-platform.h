@@ -39,11 +39,16 @@
 
 // Peers are allocated statically inside the device structure to avoid malloc
 // Increased from 1 to support multiple Tailscale peers (10 peers for larger networks)
-#define WIREGUARD_MAX_PEERS 16
+#include "sdkconfig.h"
+#define WIREGUARD_MAX_PEERS CONFIG_ML_MAX_PEERS
 #define WIREGUARD_MAX_SRC_IPS 2
 
 // Per device limit on accepting (valid) initiation requests - per peer
 #define MAX_INITIATIONS_PER_SECOND	(2)
+
+// Per device limit on initiations that reach the responder's X25519, before
+// the initiator is known
+#define MAX_DEVICE_INITIATIONS_PER_SECOND	(10)
 
 //
 // Your platform integration needs to provide implementations of these functions
