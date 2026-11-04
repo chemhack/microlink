@@ -24,8 +24,10 @@
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "mbedtls/ssl.h"
-#include "mbedtls/entropy.h"
-#include "mbedtls/ctr_drbg.h"
+/* mbedTLS 4 (ESP-IDF 6) moved ctr_drbg/entropy to a private API and dropped
+ * mbedtls_ssl_conf_rng(); the TLS layer now draws randomness from the PSA crypto
+ * subsystem, which the coord/DERP setup initialises with psa_crypto_init(). */
+#include "psa/crypto.h"
 #include "esp_heap_caps.h"
 
 #ifdef CONFIG_ML_ZERO_COPY_WG
@@ -324,8 +326,6 @@ typedef struct {
     int sockfd;                     /* Raw TCP socket */
     mbedtls_ssl_context ssl;        /* TLS context (owned exclusively by DERP I/O task) */
     mbedtls_ssl_config ssl_conf;
-    mbedtls_entropy_context entropy;
-    mbedtls_ctr_drbg_context ctr_drbg;
     bool connected;
     uint64_t last_recv_ms;          /* For keepalive watchdog */
 } ml_derp_conn_t;
@@ -379,6 +379,13 @@ struct microlink_s {
 
     /* Coordination socket (owned exclusively by coord task) */
     int coord_sock;
+    /* Control-plane TLS (issue #16): when config.ctrl_tls is set, the coord
+     * connection is wrapped in TLS, mirroring the DERP setup, so it can reach a
+     * control server behind an HTTPS reverse proxy or the hosted Tailscale
+     * service. coord_tls_up tracks whether the context below is initialised. */
+    bool coord_tls_up;
+    mbedtls_ssl_context coord_ssl;
+    mbedtls_ssl_config coord_ssl_conf;
     uint32_t h2_next_stream_id;         /* Next H2 stream ID for endpoint updates (odd, starts at 7) */
 
     /* WireGuard netif (owned exclusively by wg_mgr task) */
@@ -415,6 +422,7 @@ struct microlink_s {
     ml_derp_region_t derp_regions[ML_MAX_DERP_REGIONS];
     uint8_t derp_region_count;
     uint16_t derp_home_region;      /* Our PreferredDERP region */
+    bool derp_home_probed;          /* latency probe / selection has run once */
 
     /* Key expiry (parsed from MapResponse self-node) */
     int64_t key_expiry_epoch;       /* Unix epoch seconds, 0 = no expiry */
@@ -481,6 +489,9 @@ void ml_wg_mgr_update_transport(microlink_t *ml);
 /* ml_stun.c */
 esp_err_t ml_stun_resolve_servers(microlink_t *ml);
 esp_err_t ml_stun_send_probe(microlink_t *ml, const char *server, uint16_t port);
+/* Issue #19: probe each DERP region's STUN endpoint and return the region id that
+ * answers fastest, or 0 if none answered. One-shot, uses its own socket. */
+uint16_t ml_stun_pick_nearest_region(microlink_t *ml);
 esp_err_t ml_stun_send_probe_to(microlink_t *ml, uint32_t server_ip, uint16_t port);
 esp_err_t ml_stun_send_probe_ipv6(microlink_t *ml, const uint8_t *server_ip6, uint16_t port);
 bool ml_stun_parse_response(const uint8_t *data, size_t len,

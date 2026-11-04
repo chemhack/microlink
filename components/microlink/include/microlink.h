@@ -45,6 +45,28 @@ typedef struct {
     uint32_t disco_heartbeat_ms;    /* DISCO keepalive interval (default: 3000) */
     uint32_t stun_interval_ms;      /* STUN re-probe interval (default: 23000) */
     uint32_t ctrl_watchdog_ms;      /* Control plane watchdog timeout (default: 120000) */
+
+    /* Control-plane transport (issue #16). By default the coordination server is
+     * reached over plain TCP on port 80 - the Noise layer provides the
+     * encryption - which fails when the server sits behind an HTTPS reverse
+     * proxy (Caddy/nginx in front of Headscale) or is the hosted Tailscale
+     * service. Set ctrl_tls to wrap the coordination connection in TLS as well.
+     * ctrl_port overrides the TCP port (0 = 443 when ctrl_tls, otherwise 80). */
+    bool ctrl_tls;
+    uint16_t ctrl_port;
+
+    /* Control-server host override (NULL or "" = the hosted Tailscale default,
+     * controlplane.tailscale.com). Set to a Headscale/Ionscale/custom coordinator
+     * host so the client joins a self-hosted control plane instead. */
+    const char *ctrl_host;
+
+    /* Home DERP region (issue #19). When relaying through DERP - which is the
+     * default without direct paths - the region decides the relay's distance and
+     * so the latency. 0 (the default) picks the nearest region automatically by a
+     * one-shot STUN latency probe once the DERP map is known, falling back to
+     * Frankfurt then the built-in default if nothing answers. A non-zero value
+     * forces that region id and skips the probe. */
+    uint16_t derp_home_region;
 } microlink_config_t;
 
 /* Peer info (read-only snapshot) */
