@@ -755,8 +755,9 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 
 	uint8_t type = wireguard_get_message_type(data, len);
 
-	// Always log incoming WG packets (critical for debugging handshake issues)
-	printf("[WG_RX] type=%d (%s) len=%u from %s:%u\n",
+	// Per-packet trace. This must stay compiled out by default: a raw printf
+	// here blocks the datapath on the UART for every single packet received.
+	WG_DEBUG("[WG_RX] type=%d (%s) len=%u from %s:%u\n",
 		type,
 		type == 1 ? "INIT" : type == 2 ? "RESP" : type == 3 ? "COOKIE" : type == 4 ? "DATA" : "?",
 		(unsigned)len,
@@ -1205,7 +1206,16 @@ void wireguardif_periodic(struct netif *netif) {
 		}
 	}
 	if (!link_up) {
+		// This runs on the caller's task, not the tcpip thread: take the core
+		// lock for the netif change unless this thread already holds it.
+#if LWIP_TCPIP_CORE_LOCKING
+		bool locked = !sys_thread_tcpip(LWIP_CORE_LOCK_QUERY_HOLDER);
+		if (locked) LOCK_TCPIP_CORE();
 		netif_set_link_down(device->netif);
+		if (locked) UNLOCK_TCPIP_CORE();
+#else
+		netif_set_link_down(device->netif);
+#endif
 	}
 }
 

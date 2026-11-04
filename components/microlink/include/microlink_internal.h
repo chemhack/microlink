@@ -44,27 +44,41 @@ extern "C" {
  * Constants
  * ========================================================================== */
 
-/* Task configuration */
+/* Task configuration.
+ * Priorities are kept BELOW a co-hosted application's latency-critical tasks so
+ * MicroLink cannot starve them. If an application runs, say, an HTTPS console
+ * at prio 6 and video capture at prio 5, MicroLink's heaviest task must stay
+ * under both, or a TLS handshake (CPU-bound crypto) gets preempted long enough
+ * that the browser times out. The relative order here is preserved: the
+ * RX-latency tasks (net_io, wg_mgr) sit above the throughput tasks (derp_tx,
+ * coord). */
+/* All MicroLink tasks are pinned to core 1, leaving core 0 for an application's
+ * real-time work so the tunnel cannot steal cycles from it. */
 #define ML_TASK_NET_IO_STACK    (8 * 1024)
-#define ML_TASK_NET_IO_PRIO     7
-#define ML_TASK_NET_IO_CORE     0
+#define ML_TASK_NET_IO_PRIO     4
+#define ML_TASK_NET_IO_CORE     1
 
 #define ML_TASK_DERP_TX_STACK   (14 * 1024)
-#define ML_TASK_DERP_TX_PRIO    5
-#define ML_TASK_DERP_TX_CORE    0
+#define ML_TASK_DERP_TX_PRIO    3
+#define ML_TASK_DERP_TX_CORE    1
 
 #define ML_TASK_COORD_STACK     (12 * 1024)
-#define ML_TASK_COORD_PRIO      5
+#define ML_TASK_COORD_PRIO      3
 #define ML_TASK_COORD_CORE      1
 
 #define ML_TASK_WG_MGR_STACK    (8 * 1024)
-#define ML_TASK_WG_MGR_PRIO     7
+#define ML_TASK_WG_MGR_PRIO     4
 #define ML_TASK_WG_MGR_CORE     1
 
 /* Queue depths */
 #define ML_DERP_TX_QUEUE_DEPTH  16
-#define ML_DISCO_RX_QUEUE_DEPTH 8
-#define ML_WG_RX_QUEUE_DEPTH    8
+#define ML_DISCO_RX_QUEUE_DEPTH 16
+/* Deep enough to hold a TCP window's worth of packets while the manager task
+ * is busy with a handshake or a DISCO probe round. The enqueue in
+ * ml_net_io.c is non-blocking, so an overflow here is a silent drop; at 8 a
+ * bulk transfer lost enough packets to collapse TCP. Each slot holds a
+ * pointer and a few fields, not the packet. */
+#define ML_WG_RX_QUEUE_DEPTH    64
 #define ML_STUN_RX_QUEUE_DEPTH  4
 #define ML_COORD_CMD_QUEUE_DEPTH 4
 #define ML_PEER_UPDATE_QUEUE_DEPTH 400
@@ -341,6 +355,9 @@ struct microlink_s {
     /* State (atomic reads from any task, writes only from coord) */
     volatile microlink_state_t state;
     volatile uint32_t vpn_ip;
+    /* Our own MagicDNS FQDN from the control plane (e.g. "host.tailnet.ts.net"),
+     * empty until a MapResponse names us. Written only from coord. */
+    char self_name[128];
 
     /* Event group (cross-task synchronization) */
     EventGroupHandle_t events;
