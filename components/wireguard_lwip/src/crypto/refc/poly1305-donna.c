@@ -1,7 +1,13 @@
 // Taken from https://github.com/floodyberry/poly1305-donna - public domain or MIT
 
 #include "poly1305-donna.h"
+#include "../../crypto.h"
+
+#ifdef POLY1305_BASE32
+#include "poly1305-base32.h"
+#else
 #include "poly1305-donna-32.h"
+#endif
 
 void
 poly1305_update(poly1305_context *ctx, const unsigned char *m, size_t bytes) {

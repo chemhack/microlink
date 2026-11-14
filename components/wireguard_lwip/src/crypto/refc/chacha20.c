@@ -126,10 +126,26 @@ static void chacha20_block_words(const uint32_t *s, uint32_t *ks) {
 #define CHACHA20_WORD_XOR 0
 #endif
 
+#ifdef CRYPTO_ESP32P4_ZB
+void chacha20_blocks_esp32p4(uint32_t state[16], uint8_t *out, const uint8_t *in, uint32_t nblocks);
+#endif
+
 void chacha20(struct chacha20_ctx *ctx, uint8_t *out, const uint8_t *in, uint32_t len) {
 	uint32_t ks[16];
 	uint8_t tail[CHACHA20_BLOCK_SIZE];
 	int i;
+
+#ifdef CRYPTO_ESP32P4_ZB
+	if (crypto_esp32p4_zb && len >= CHACHA20_BLOCK_SIZE &&
+	    (((uintptr_t)in | (uintptr_t)out) & 3) == 0) {
+		uint32_t done = len / CHACHA20_BLOCK_SIZE;
+		chacha20_blocks_esp32p4(ctx->state, out, in, done);
+		done *= CHACHA20_BLOCK_SIZE;
+		len -= done;
+		out += done;
+		in += done;
+	}
+#endif
 
 	while (len >= CHACHA20_BLOCK_SIZE) {
 		chacha20_block_words(ctx->state, ks);

@@ -4,6 +4,27 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include "sdkconfig.h"
+
+// ESP32-P4 chip revision v3.x added the bit-manipulation extension (Zb), per
+// Espressif's "ESP32-P4 Chip Revision v3.x User Guide", but ESP-IDF's -march
+// leaves it out (espressif/esp-idf#19299). Images for v3.x chips carry an
+// assembly ChaCha20 that rotates with Zbb (crypto/refc/chacha20_esp32p4.S,
+// built by CMakeLists.txt on the same terms) next to the C one, and use it
+// when crypto_esp32p4_zb is set: at startup, on revision v3.2 or later, the
+// revision it has been verified on.
+#if defined(CONFIG_IDF_TARGET_ESP32P4) && !defined(CONFIG_ESP32P4_SELECTS_REV_LESS_V3) && \
+	defined(__GNUC__) && !defined(__clang__)
+#define CRYPTO_ESP32P4_ZB 1
+extern bool crypto_esp32p4_zb;
+#endif
+
+// On the ESP32-P4 a 64-bit product takes a mul and a mulhu, so Poly1305 keeps
+// its accumulator in base 2^32, which needs fewer of them than base 2^26
+// (crypto/refc/poly1305-base32.h).
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
+#define POLY1305_BASE32 1
+#endif
 
 // BLAKE2S IMPLEMENTATION
 #include "crypto/refc/blake2s.h"
