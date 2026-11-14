@@ -128,6 +128,33 @@ static void chacha20_block_words(const uint32_t *s, uint32_t *ks) {
 
 #ifdef CRYPTO_ESP32P4_ZB
 void chacha20_blocks_esp32p4(uint32_t state[16], uint8_t *out, const uint8_t *in, uint32_t nblocks);
+
+// Every block goes through the assembly: aligned whole blocks in place, and
+// unaligned or partial blocks (such as the 32 bytes of a Poly1305 key, or the
+// end of a packet) through an aligned buffer, which costs far less than a
+// block in C.
+static void chacha20_esp32p4(struct chacha20_ctx *ctx, uint8_t *out, const uint8_t *in, uint32_t len) {
+	uint32_t buf[CHACHA20_BLOCK_SIZE / 4];
+
+	if ((((uintptr_t)in | (uintptr_t)out) & 3) == 0) {
+		uint32_t done = len / CHACHA20_BLOCK_SIZE;
+		chacha20_blocks_esp32p4(ctx->state, out, in, done);
+		done *= CHACHA20_BLOCK_SIZE;
+		len -= done;
+		out += done;
+		in += done;
+	}
+	while (len) {
+		uint32_t n = len < CHACHA20_BLOCK_SIZE ? len : CHACHA20_BLOCK_SIZE;
+		memcpy(buf, in, n);
+		chacha20_blocks_esp32p4(ctx->state, (uint8_t *)buf, (const uint8_t *)buf, 1);
+		memcpy(out, buf, n);
+		len -= n;
+		out += n;
+		in += n;
+	}
+	crypto_zero(buf, sizeof(buf));
+}
 #endif
 
 void chacha20(struct chacha20_ctx *ctx, uint8_t *out, const uint8_t *in, uint32_t len) {
@@ -136,14 +163,9 @@ void chacha20(struct chacha20_ctx *ctx, uint8_t *out, const uint8_t *in, uint32_
 	int i;
 
 #ifdef CRYPTO_ESP32P4_ZB
-	if (crypto_esp32p4_zb && len >= CHACHA20_BLOCK_SIZE &&
-	    (((uintptr_t)in | (uintptr_t)out) & 3) == 0) {
-		uint32_t done = len / CHACHA20_BLOCK_SIZE;
-		chacha20_blocks_esp32p4(ctx->state, out, in, done);
-		done *= CHACHA20_BLOCK_SIZE;
-		len -= done;
-		out += done;
-		in += done;
+	if (crypto_esp32p4_zb) {
+		chacha20_esp32p4(ctx, out, in, len);
+		return;
 	}
 #endif
 

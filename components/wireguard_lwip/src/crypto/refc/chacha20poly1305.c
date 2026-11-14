@@ -47,7 +47,9 @@ static const uint8_t zero[CHACHA20_BLOCK_SIZE] = { 0 };
 
 // 2.6.  Generating the Poly1305 Key Using ChaCha20
 static void generate_poly1305_key(struct poly1305_context *poly1305_state, struct chacha20_ctx *chacha20_state, const uint8_t *key, uint64_t nonce) {
-	uint8_t block[POLY1305_KEY_SIZE] = {0};
+	// A whole aligned block: the cipher computes one either way, and a whole
+	// aligned block can take a faster path than a partial one.
+	uint32_t block[CHACHA20_BLOCK_SIZE / 4] = {0};
 
 	// The method is to call the block function with the following parameters:
 	// - The 256-bit session integrity key is used as the ChaCha20 key.
@@ -56,9 +58,9 @@ static void generate_poly1305_key(struct poly1305_context *poly1305_state, struc
 	chacha20_init(chacha20_state, key, nonce);
 
 	// We take the first 256 bits or the serialized state, and use those as the one-time Poly1305 key
-	chacha20(chacha20_state, block, block, sizeof(block));
+	chacha20(chacha20_state, (uint8_t *)block, (const uint8_t *)block, sizeof(block));
 
-	poly1305_init(poly1305_state, block);
+	poly1305_init(poly1305_state, (const uint8_t *)block);
 
 	crypto_zero(&block, sizeof(block));
 }
@@ -67,7 +69,7 @@ static void generate_poly1305_key(struct poly1305_context *poly1305_state, struc
 void chacha20poly1305_encrypt(uint8_t *dst, const uint8_t *src, size_t src_len, const uint8_t *ad, size_t ad_len, uint64_t nonce, const uint8_t *key) {
 	struct poly1305_context poly1305_state;
 	struct chacha20_ctx chacha20_state;
-	uint8_t block[8];
+	uint8_t block[16];
 	size_t padded_len;
 
 	// First, a Poly1305 one-time key is generated from the 256-bit key and nonce using the procedure described in Section 2.6.
@@ -89,9 +91,10 @@ void chacha20poly1305_encrypt(uint8_t *dst, const uint8_t *src, size_t src_len, 
 	poly1305_update(&poly1305_state, zero, padded_len - src_len);
 	// - The length of the additional data in octets (as a 64-bit little-endian integer)
 	U64TO8_LITTLE(block, (uint64_t)ad_len);
-	poly1305_update(&poly1305_state, block, sizeof(block));
 	// - The length of the ciphertext in octets (as a 64-bit little-endian integer).
-	U64TO8_LITTLE(block, (uint64_t)src_len);
+	U64TO8_LITTLE(block + 8, (uint64_t)src_len);
+	// One 16-byte update: the padding above leaves no partial block, so this
+	// goes straight to the block function.
 	poly1305_update(&poly1305_state, block, sizeof(block));
 
 	// The output from the AEAD is twofold:
@@ -108,7 +111,7 @@ void chacha20poly1305_encrypt(uint8_t *dst, const uint8_t *src, size_t src_len, 
 bool chacha20poly1305_decrypt(uint8_t *dst, const uint8_t *src, size_t src_len, const uint8_t *ad, size_t ad_len, uint64_t nonce, const uint8_t *key) {
 	struct poly1305_context poly1305_state;
 	struct chacha20_ctx chacha20_state;
-	uint8_t block[8];
+	uint8_t block[16];
 	uint8_t mac[POLY1305_MAC_SIZE];
 	size_t padded_len;
 	int dst_len;
@@ -140,9 +143,8 @@ bool chacha20poly1305_decrypt(uint8_t *dst, const uint8_t *src, size_t src_len, 
 		poly1305_update(&poly1305_state, zero, padded_len - dst_len);
 		// - The length of the additional data in octets (as a 64-bit little-endian integer)
 		U64TO8_LITTLE(block, (uint64_t)ad_len);
-		poly1305_update(&poly1305_state, block, sizeof(block));
 		// - The length of the ciphertext in octets (as a 64-bit little-endian integer).
-		U64TO8_LITTLE(block, (uint64_t)dst_len);
+		U64TO8_LITTLE(block + 8, (uint64_t)dst_len);
 		poly1305_update(&poly1305_state, block, sizeof(block));
 
 		// The output from the AEAD is twofold:

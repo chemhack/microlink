@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 
 #ifdef CRYPTO_ESP32P4_ZB
 #include "hal/efuse_hal.h"
@@ -15,10 +16,10 @@ __attribute__((constructor)) static void crypto_detect_esp32p4_zb(void) {
 #endif
 
 void crypto_zero(void *dest, size_t len) {
-	volatile uint8_t *p = (uint8_t *)dest;
-	while (len--) {
-		*p++ = 0;
-	}
+	// memset runs a word at a time; the empty asm that takes dest and clobbers
+	// memory stops the compiler from dropping the stores as dead.
+	memset(dest, 0, len);
+	__asm__ __volatile__("" : : "r"(dest) : "memory");
 }
 
 bool crypto_equal(const void *a, const void *b, size_t size) {
